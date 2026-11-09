@@ -13,5 +13,3 @@ services:
         value: A2-6e7ef869
       - key: ADMIN_KEY
         generateValue: true
-      - key: BANS
-        value: ""

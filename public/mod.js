@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 2;
+  const MOD_VERSION = 3;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -433,7 +433,7 @@
   const connect = name => {
     ws = new WebSocket(SERVER);
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', v: PROTO, name, car: carSel }));
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', v: PROTO, name, car: carSel, mod: MOD_VERSION, loader: window.SRMP_LOADER || 0 }));
     ws.onmessage = e => typeof e.data === 'string' ? onMsg(JSON.parse(e.data)) : e.data.byteLength >= 7 && new DataView(e.data).getUint8(0) === 2 && onTick(new DataView(e.data));
     ws.onclose = e => {
       clearGhosts();

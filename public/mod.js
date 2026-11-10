@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 1;
+  const MOD_VERSION = 2;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -11,7 +11,9 @@
   const CARS = ['coupe', 'coach', 'bike', 'drift'];
   const PICK = [['coupe', 'Coupe'], ['coach', 'Coach'], ['bike', 'Bike']]; // index = game's setVehicle index
   const MASS = { coupe: 1, coach: 4, bike: 0.35, drift: 1 };
-  const DELAY = 100, EXTRAP = 250, CULL2 = 1500 ** 2, TAG_DIST = 800, REST = 0.3, MAXJ = 12, REC = 29;
+  // max speed change (m/s) one contact can give you, per frame and in total. bikes balance/lean, so a big sideways kick flings them
+  const KICK = { coupe: [12, 30], coach: [12, 30], drift: [12, 30], bike: [3, 5] };
+  const DELAY = 100, EXTRAP = 250, CULL2 = 1500 ** 2, TAG_DIST = 800, REST = 0.3, REC = 29;
   const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
   const hashWorld = () => location.hash.slice(1).split('@')[0];
 
@@ -284,7 +286,7 @@
       const was = o.on;
       o.on = false;
       const p = e.contactPoint;
-      if (!joined || !p || !obstacles.length || !myBox.ok) return false;
+      if (!joined || !p || !obstacles.length || !myBox.ok || car.type === 'bike') return false; // bike: impulse only
       let best = WALL_RANGE, hit = null, nx = 0, nz = 0;
       for (const b of obstacles) {
         if (Math.abs(p.y - b.y) > b.h + 1) continue;
@@ -341,14 +343,17 @@
       const ra = A.hx * Math.abs(A.ux * lx + A.uz * lz) + A.hz * Math.abs(A.wx * lx + A.wz * lz);
       const rb = B.hx * Math.abs(B.ux * lx + B.uz * lz) + B.hz * Math.abs(B.wx * lx + B.wz * lz);
       const d = dx * lx + dz * lz, ov = ra + rb - Math.abs(d);
-      if (ov <= 0) return;
+      if (ov <= 0) { g.kicked = 0; return; }
       if (ov < depth) { depth = ov; const sg = d < 0 ? -1 : 1; nx = lx * sg; nz = lz * sg; }
     }
+    const [perFrame, perContact] = KICK[car.type] || KICK.coupe;
     const v = C.chassisVel, gv = g.vel || [0, 0, 0];
     const vr = (v.x - gv[0]) * nx + (v.z - gv[2]) * nz;
-    const target = Math.max(Math.min(depth, 1) * 3, -REST * vr);
+    const target = Math.max(Math.min(depth, 1) * (car.type === 'bike' ? 1.5 : 3), -REST * vr);
     if (vr >= target) return;
-    const j = Math.min((target - vr) * MASS[g.type] / (MASS[car.type] + MASS[g.type]), MAXJ);
+    const j = Math.min((target - vr) * MASS[g.type] / (MASS[car.type] + MASS[g.type]), perFrame, perContact - (g.kicked || 0));
+    if (j <= 0) return;
+    g.kicked = (g.kicked || 0) + j; // resets once you're apart, so one bump can't stack into a launch
     v.x += nx * j; v.z += nz * j;
   };
 

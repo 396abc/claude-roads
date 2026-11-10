@@ -2,6 +2,8 @@
 // commands (stdin locally, or: curl -H "x-admin-key: KEY" -d "list" https://host/admin):
 //   list | kick <name> | ban <name> | unban <ip> | env <season|time|weather|location|world> <value> | say <msg>
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { WebSocketServer } = require('ws');
 const readline = require('readline');
 
@@ -19,6 +21,15 @@ const VALID = {
   world: /^[A-Z]\d-[0-9a-f]{8}$/i
 };
 const ENV = { world: process.env.WORLD || 'A2-6e7ef869', season: 'summer', time: 'day', weather: 'clear', location: 'mars' };
+
+// latest client code, read once (files only change on redeploy)
+const PUB = path.join(__dirname, 'public');
+const MOD = (() => {
+  try {
+    const code = fs.readFileSync(path.join(PUB, 'mod.js'), 'utf8');
+    return { code, mod: +(code.match(/const MOD_VERSION = (\d+);/) || [])[1] || 0, loader: +(code.match(/const NEEDS_LOADER = (\d+);/) || [])[1] || 1 };
+  } catch { return null; }
+})();
 
 const players = new Map(); // ws -> player
 const bans = new Set((process.env.BANS || '').split(',').map(s => s.trim()).filter(Boolean)), perIp = new Map();
@@ -38,6 +49,21 @@ const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', c => { body += c; if (body.length > 500) req.destroy(); });
     req.on('end', () => res.writeHead(200, { 'content-type': 'text/plain' }).end(command(body) + '\n'));
+    return;
+  }
+  // auto-update: the extension polls /version and pulls /mod.js; /extension.zip for loader updates
+  if (req.url === '/version' || req.url === '/mod.js') {
+    const cors = { 'access-control-allow-origin': 'https://slowroads.io', 'cache-control': 'no-store' };
+    if (!MOD) { res.writeHead(404, cors).end(); return; }
+    if (req.url === '/version') res.writeHead(200, { ...cors, 'content-type': 'application/json' }).end(JSON.stringify({ mod: MOD.mod, loader: MOD.loader }));
+    else res.writeHead(200, { ...cors, 'content-type': 'text/javascript; charset=utf-8' }).end(MOD.code);
+    return;
+  }
+  if (req.url === '/extension.zip') {
+    fs.readFile(path.join(PUB, 'extension.zip'), (err, buf) => {
+      if (err) { res.writeHead(404).end(); return; }
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-disposition': 'attachment; filename="slowroads-mp-extension.zip"' }).end(buf);
+    });
     return;
   }
   if (req.url === '/info') {

@@ -10,6 +10,7 @@ const readline = require('readline');
 const PORT = +process.env.PORT || 8080;
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
+const PUBLIC_URL = (process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || 'https://slowroads-mp.onrender.com').replace(/\/$/, '');
 const PROTO = 3, TICK = 66, REC = 29, CARS = 4;
 const MAX_PLAYERS = 32, PER_IP = 3, MAX_SPEED = 120, VIEW2 = 3000 ** 2, TP_COOLDOWN = 8000;
 const ORIGINS = new Set(['https://slowroads.io']);
@@ -122,8 +123,14 @@ function hello(p, raw) {
   p.rec[28] = Math.max(0, ['coupe', 'coach', 'bike', 'drift'].indexOf(m.car));
   json(p.ws, { t: 'welcome', id: p.id, name, env: ENV, players: list });
   bcast({ t: 'join', id: p.id, name, c: p.rec[28] }, p.ws);
-  console.log(`+ ${name} (${p.ip})`);
+  // extensions from before the auto-updater (no loader) can't update themselves: nag them via toasts until they reinstall
+  p.outdated = !(m.loader >= (MOD?.loader || 1));
+  if (p.outdated) setTimeout(() => p.outdated && players.has(p.ws) && nag(p), 20000); // loader-era clients usually update first
+  console.log(`+ ${name} (${p.ip})${p.outdated ? ' [old extension]' : ''}`);
 }
+
+const nag = p => json(p.ws, { t: 'toast', msg: `no 'update ready' prompt? your extension is too old, get the new one: ${PUBLIC_URL}/extension.zip → unzip → chrome://extensions → remove old → load unpacked` });
+setInterval(() => online().filter(p => p.outdated).forEach(nag), 60000);
 
 function state(p, d) {
   const x = d.readFloatLE(1), y = d.readFloatLE(5), z = d.readFloatLE(9);

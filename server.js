@@ -128,9 +128,9 @@ wss.on('connection', (ws, req) => {
     if (p.msgs > 30) return;
     if (!p.name) return bin ? ws.close(4004, 'bad hello') : hello(p, data);
     if (bin && (data.length === 28 || data.length === 34) && data[0] === 1) return state(p, data);
-    if (!bin && data.length < 120) { // small json events after join: hit reports for traffic crashes
+    if (!bin && data.length < 200) { // small json events after join: hit reports for traffic crashes
       let m; try { m = JSON.parse(data); } catch { return; }
-      if (m.t === 'hit') traffic.hit(p, m.id | 0, +m.v);
+      if (m.t === 'hit') traffic.hit(p, m.id | 0, +m.v, +m.dvs, +m.dvl, +m.spin, +m.wl, +m.wr);
     }
   });
 

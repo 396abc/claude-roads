@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 9;
+  const MOD_VERSION = 10;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -309,7 +309,22 @@
     const C = car.controller;
     C.collisionStrength = Math.max(C.collisionStrength || 0, Math.min(1, cv / 15));
     C.collisionPos?.set?.(x, y + 0.5, z);
-    if (g.isNpc && ws?.readyState === 1) ws.send(JSON.stringify({ t: 'hit', id: g.id, v: +cv.toFixed(1) }));
+  };
+  // rough masses (a coupe = 1): a coach shrugs you off, a bike gets launched
+  const MASS = { coupe: 1, coach: 4, bike: 0.4 };
+  // the push we gave an NPC (world-space change in its velocity + spin) goes to the server in road terms, and we
+  // predict it locally right away so it moves the same frame instead of after the round trip
+  const sendPush = (N, first, now) => {
+    const dvx = N.pdx || 0, dvz = N.pdz || 0, sp = N.pspin || 0;
+    N.pdx = N.pdz = N.pspin = 0; N.lastPush = now; N.hold = now + 300;
+    if (!roadPoint(N.rs, N.rlat)) return;
+    const dvs = dvx * RP.fx + dvz * RP.fz, dvl = dvx * RP.nx + dvz * RP.nz;
+    const v = first ? N.hitV : Math.hypot(dvx, dvz);
+    // local prediction: rebase on where it is now, then add the shove
+    const srvNow = performance.now() - off;
+    N.s = N.rs; N.lat = N.rlat; N.t = srvNow; N.vs += dvs; N.vl = Math.max(-12, Math.min(12, N.vl + dvl));
+    if (first && v > 6) { N.wreck = true; N.tyaw = N.ryaw + sp * Math.PI / 180; }
+    if (ws?.readyState === 1) ws.send(JSON.stringify({ t: 'hit', id: N.id, v: +v.toFixed(1), dvs: +dvs.toFixed(2), dvl: +dvl.toFixed(2), spin: Math.round(sp), wl: N.wl, wr: N.wr }));
   };
 
   // our car's physics state, for both kinds of vehicle in slowroads:
@@ -365,12 +380,17 @@
     cAx /= A.length; cAz /= A.length; cBx /= B.length; cBz /= B.length;
     if ((cAx - cBx) * nx + (cAz - cBz) * nz < 0) { nx = -nx; nz = -nz; }
 
-    const v = myVel(), gv = g.vel || [0, 0, 0], share = g.isNpc ? 1 : 0.5, bike = car.type === 'bike' || isBikeCtl(C);
+    const v = myVel(), gv = g.vel || [0, 0, 0], bike = car.type === 'bike' || isBikeCtl(C);
+    // momentum: vs an NPC we keep m_them/(m_us+m_them) of the hit and they take the rest. vs a player each side does half
+    const mMe = MASS[car.type] || 1, mThem = MASS[g.type] || 1;
+    const share = g.isNpc ? mThem / (mMe + mThem) : 0.5;
     const rx = v.x - gv[0], rz = v.z - gv[2], vr = rx * nx + rz * nz; // vr < 0: closing
-    if (!g.contact) { g.contact = true; g.spun = 0; g.used = 0; g.cv = Math.max(0, -vr); onImpact(g, g.cv, (cAx + cBx) / 2, P1.y, (cAz + cBz) / 2); }
+    const now = performance.now();
+    if (!g.contact) { g.contact = true; g.spun = 0; g.used = 0; g.cv = Math.max(0, -vr); g.hitV = g.cv; g.first = true; onImpact(g, g.cv, (cAx + cBx) / 2, P1.y, (cAz + cBz) / 2); }
 
-    // 1. solid: step out of the overlap (deep overlaps from spawns/teleports resolve over a few frames, not one jump)
-    const push = Math.min(depth * share + 0.005, 0.5);
+    // 1. solid: step out of the overlap (deep overlaps from spawns/teleports resolve over a few frames, not one jump).
+    // NPCs only move when the server says so, so we always take the whole positional fix ourselves
+    const push = Math.min(depth * (g.isNpc ? 1 : 0.5) + 0.005, 0.5);
     nudge(nx * push, nz * push);
 
     // 2. inelastic: cancel our share of the closing speed (vs a player: our fair half of the hit in total)
@@ -380,10 +400,15 @@
     // 3. scraping friction
     const tx = rx - nx * vr, tz = rz - nz * vr;
     ix -= tx * 0.04 * share; iz -= tz * 0.04 * share;
-    if (bike) { // a hard sideways shove tips a bike into the game's crash-reset: halve the across-the-bike part
-      const fl = Math.hypot(P1.ax, P1.az) || 1, fx = P1.ax / fl, fz = P1.az / fl;
-      const lon = ix * fx + iz * fz, lat = (ix * -fz + iz * fx) * 0.5;
-      ix = fx * lon - fz * lat; iz = fz * lon + fx * lat;
+    if (g.isNpc && (ix || iz)) {
+      // equal and opposite: whatever we lost they gain, scaled by mass (lighter one moves more)
+      const k = -mMe / mThem;
+      g.pdx = (g.pdx || 0) + ix * k; g.pdz = (g.pdz || 0) + iz * k;
+      // off-centre hits spin them: torque about their centre from where we hit, + = anticlockwise (their yaw sign)
+      const ox = (cAx + cBx) / 2 - P2.x, oz = (cAz + cBz) / 2 - P2.z;
+      const Ib = (P2.M.hx * P2.M.hx + P2.M.hz * P2.M.hz) / 3;
+      g.pspin = Math.max(-80, Math.min(80, (g.pspin || 0) + (oz * ix * k - ox * iz * k) / Ib * 57.3 * 0.6));
+      if (g.first || (now - (g.lastPush || 0) > 150 && Math.hypot(g.pdx, g.pdz) > 0.3)) { sendPush(g, g.first, now); g.first = false; }
     }
     addVel(ix, iz);
     // a little spin from off-centre hits (cars only), capped per contact
@@ -495,8 +520,9 @@
       const lat = dv.getInt8(o + 8) / 35, vl = dv.getInt8(o + 9) / 20, fl = dv.getUint8(o + 10), yaw = dv.getInt8(o + 11) * 1.5 * Math.PI / 180;
       let N = npcs.get(id);
       if (!N) npcs.set(id, N = { id, isNpc: true, type: CARS[fl & 3] || 'coupe', color: (fl >> 2) & 7, rs: s, rlat: lat, rvl: 0, ryaw: yaw, pose: {}, vel: [0, 0, 0] });
-      N.s = s; N.vs = vs; N.lat = lat; N.vl = vl; N.t = st; N.seen = now; N.tyaw = yaw;
-      N.dir = fl & 128 ? -1 : 1; N.wreck = !!(fl & 64);
+      N.seen = now; N.dir = fl & 128 ? -1 : 1;
+      if (now < (N.hold || 0)) continue; // we just shoved it: keep our prediction until the server has caught up
+      N.s = s; N.vs = vs; N.lat = lat; N.vl = vl; N.t = st; N.tyaw = yaw; N.wreck = !!(fl & 64);
     }
   };
   const fleetFor = (type, need) => {
@@ -536,11 +562,19 @@
       N.ryaw += (N.tyaw - N.ryaw) * Math.min(1, dt * (N.wreck ? 7 : 2)); // wrecks spin out fast, recover slowly
       // walls: where the game has barriers on this stretch, NPCs (skidding wrecks, swerves) stop at them instead of passing
       // through. it's the game's own road data and identical for everyone, so every client stops them in the same place
-      const Mw = models[N.type] || models.coupe, nb = road.by.get(Math.floor(N.rs / NODE));
-      if (Mw && nb) {
+      // stone walls (dswl/dswr, along fields) count too: they're signed lateral positions, guardrails are distances
+      const Mw = models[N.type] || models.coupe, ni = Math.floor(N.rs / NODE);
+      let wr = Infinity, wl = -Infinity;
+      for (const nb of [road.by.get(ni), road.by.get(ni + 1)]) {
+        if (!nb) continue;
+        if (nb.rWallDist > 0) wr = Math.min(wr, nb.rWallDist); if (nb.dswr > 3) wr = Math.min(wr, nb.dswr);
+        if (nb.lWallDist > 0) wl = Math.max(wl, -nb.lWallDist); if (nb.dswl < -3) wl = Math.max(wl, nb.dswl);
+      }
+      N.wr = wr < 30 ? +wr.toFixed(1) : 0; N.wl = wl > -30 ? +wl.toFixed(1) : 0;
+      if (Mw) {
         const ys = Math.abs(Math.sin(N.ryaw)), hw = ys * Mw.hx + (1 - ys) * Mw.hz + 0.1; // wider when spun sideways
-        if (nb.rWallDist && N.rlat > nb.rWallDist - hw) N.rlat = nb.rWallDist - hw;
-        if (nb.lWallDist && N.rlat < hw - nb.lWallDist) N.rlat = hw - nb.lWallDist;
+        if (N.rlat > wr - hw) { N.rlat = wr - hw; if (N.vl > 0) N.vl = N.rvl = 0; }
+        if (N.rlat < wl + hw) { N.rlat = wl + hw; if (N.vl < 0) N.vl = N.rvl = 0; }
       }
       N.near = false;
       if (!roadPoint(N.rs, N.rlat)) continue;

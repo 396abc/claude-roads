@@ -1,6 +1,7 @@
 // npm i && node server.js     env: PORT, WORLD, TRUST_PROXY=1 (behind render/cloudflared/nginx), ADMIN_KEY, BANS (comma list of ips)
 // commands (stdin locally, or: curl -H "x-admin-key: KEY" -d "list" https://host/admin):
-//   list | kick <name> | ban <name> | unban <ip> | env <season|time|weather|location|world> <value> | say <msg>
+//   list | kick <name> | ban <name> | unban <ip> | env <season|time|weather|location|world> <value> | say <msg> | traffic on|off|density <n>
+// env TRAFFIC=0 disables traffic, DENSITY=<cars per km per lane> (default 4)
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -72,7 +73,7 @@ const server = http.createServer((req, res) => {
       .end(JSON.stringify({ world: ENV.world, online: online().length }));
     return;
   }
-  res.writeHead(200, { 'content-type': 'text/plain' }).end(`slowroads mp · ${online().length} online\n`);
+  res.writeHead(200, { 'content-type': 'text/plain' }).end(`slowroads mp · ${online().length} online · ${traffic.count} npcs\n`);
 });
 const wss = new WebSocketServer({ server, maxPayload: 256, perMessageDeflate: false });
 server.listen(PORT, '0.0.0.0');
@@ -93,7 +94,7 @@ wss.on('connection', (ws, req) => {
     if (++p.msgs > 60) return kick(p, 'spam');
     if (p.msgs > 30) return;
     if (!p.name) return bin ? ws.close(4004, 'bad hello') : hello(p, data);
-    if (bin && data.length === 28 && data[0] === 1) state(p, data);
+    if (bin && (data.length === 28 || data.length === 34) && data[0] === 1) state(p, data);
   });
 
   ws.on('close', () => {
@@ -159,6 +160,17 @@ function state(p, d) {
   }
   if (p.rec[28] >= CARS) p.rec[28] = 0;
   p.dirty = true;
+
+  // road position (34-byte packets): distance along the road + lateral offset, used by traffic
+  if (d.length === 34) {
+    const s = d.readFloatLE(28), lat = d.readInt16LE(32) / 100;
+    if (Number.isFinite(s) && Math.abs(s) < 1e7) {
+      const r = p.road;
+      // speed along the road, smoothed from successive positions (no extra field needed)
+      const vs = r && t > r.t ? Math.max(-MAX_SPEED, Math.min(MAX_SPEED, (s - r.s) / ((t - r.t) / 1000))) : 0;
+      p.road = { s, lat, t, vs: r && Math.abs(s - r.s) < 200 ? r.vs * 0.6 + vs * 0.4 : 0, fresh: !r };
+    } else p.road = null;
+  }
 }
 
 // one batched packet per client per tick, only players that moved and are within view range
@@ -179,6 +191,11 @@ setInterval(() => {
     r.ws.send(buf);
   }
 }, TICK);
+
+const traffic = require('./traffic')({
+  online, clock,
+  send: (p, buf) => p.ws.readyState === 1 && p.ws.bufferedAmount < 65536 && p.ws.send(buf)
+});
 
 setInterval(() => { for (const p of players.values()) p.msgs = 0; }, 1000);
 setInterval(() => { for (const p of players.values()) p.speedHits = Math.max(0, p.speedHits - 100); }, 30000);
@@ -201,6 +218,7 @@ function command(line) {
     kick(p, cmd === 'ban' ? 'banned' : 'kicked');
     return `${cmd}ed ${p.name}` + (cmd === 'ban' ? ` (${p.ip}, add to BANS env to keep it after restarts)` : '');
   }
+  if (cmd === 'traffic') return traffic.command(a, rest[0]);
   if (cmd === 'unban') return bans.delete(a) ? 'unbanned' : 'not banned';
   if (cmd === 'say') { bcast({ t: 'toast', msg: ('[server] ' + [a, ...rest].join(' ')).slice(0, 120) }); return 'sent'; }
   if (cmd === 'env') {
@@ -210,7 +228,7 @@ function command(line) {
     bcast({ t: 'env', env: ENV });
     return 'env ' + JSON.stringify(ENV);
   }
-  return 'commands: list, kick <name>, ban <name>, unban <ip>, env <key> <value>, say <msg>';
+  return 'commands: list, kick <name>, ban <name>, unban <ip>, env <key> <value>, say <msg>, traffic on|off|density <n>';
 }
 if (process.stdin.isTTY) readline.createInterface({ input: process.stdin }).on('line', l => console.log(command(l)));
 

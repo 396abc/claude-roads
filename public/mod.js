@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 10;
+  const MOD_VERSION = 11;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -394,7 +394,7 @@
     nudge(nx * push, nz * push);
 
     // 2. inelastic: cancel our share of the closing speed (vs a player: our fair half of the hit in total)
-    let j = vr < 0 ? -vr * share : 0;
+    let j = vr < 0 ? -vr * share * (g.first ? 1.2 : 1) : 0;
     if (!g.isNpc && j > 0) { const left = g.cv * share + 0.5 - g.used; j = Math.min(j, Math.max(left, 0.3)); g.used += j; }
     let ix = nx * j, iz = nz * j;
     // 3. scraping friction
@@ -411,6 +411,7 @@
       if (g.first || (now - (g.lastPush || 0) > 150 && Math.hypot(g.pdx, g.pdz) > 0.3)) { sendPush(g, g.first, now); g.first = false; }
     }
     addVel(ix, iz);
+    g.first = false;
     // a little spin from off-centre hits (cars only), capped per contact
     if (!bike && C.chassisRotVel && j > 0.5 && g.spun < 0.6) {
       const ox = (cBx - cAx) / 2, oz = (cBz - cAz) / 2, I = (MA.hx * MA.hx + MA.hz * MA.hz) / 3;
@@ -556,8 +557,11 @@
       // predict from the last packet (server sim is smooth: speed along the road + a steering-limited sideways speed)
       const age = Math.max(0, Math.min(1, (srvNow - N.t) / 1000));
       const ps = N.s + N.vs * age, pl = N.lat + N.vl * Math.min(age, 0.5);
-      N.rs = Math.abs(ps - N.rs) > 30 ? ps : N.rs + (ps - N.rs) * Math.min(1, dt * 6);
-      N.rlat += (pl - N.rlat) * Math.min(1, dt * 8);
+      // move at its known speed, then bleed off the error to where the server says it is. (plain smoothing toward the
+      // target lagged ~4m behind at highway speed, so the car you saw wasn't where the server had it = "crashes" before contact)
+      N.rs += N.vs * dt; N.rlat += N.vl * dt * (age < 0.5 ? 1 : 0);
+      N.rs = Math.abs(ps - N.rs) > 30 ? ps : N.rs + (ps - N.rs) * Math.min(1, dt * 4);
+      N.rlat += (pl - N.rlat) * Math.min(1, dt * 5);
       N.rvl += (N.vl - N.rvl) * Math.min(1, dt * 6);
       N.ryaw += (N.tyaw - N.ryaw) * Math.min(1, dt * (N.wreck ? 7 : 2)); // wrecks spin out fast, recover slowly
       // walls: where the game has barriers on this stretch, NPCs (skidding wrecks, swerves) stop at them instead of passing

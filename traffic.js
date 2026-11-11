@@ -86,7 +86,7 @@ module.exports = function traffic({ online, clock, send }) {
     n.dis = 0; n.squeeze = false; n.swerveT = 0;
     n.skidS = clamp(skidS ?? vAlong(n) * 0.5, -40, 40);
     n.vl = clamp(n.vl + sideKick, -12, 12);
-    if (spin) n.yawTarget = clamp((n.yawTarget || 0) + spin, -100, 100);
+    if (spin != null) n.yawTarget = clamp((n.yawTarget || 0) + spin, -100, 100);
     else if (fresh) n.yawTarget = (Math.random() < 0.5 ? 1 : -1) * rand(15, 25 + 55 * Math.min(1, sev / 20)); // harder hit, bigger spin
     n.v = 0;
   };
@@ -111,8 +111,11 @@ module.exports = function traffic({ online, clock, send }) {
     for (const n of npcs.values()) {
       if (n.ghostT > 0) n.ghostT -= dt;
       if (n.crashT > 0) { // wrecked: slides on whatever momentum the hit left it (tyre friction ~0.6g), then sits there blocking
-        const fr = 6 * dt, dirS = Math.sign(n.skidS || 0);
-        n.skidS = Math.abs(n.skidS || 0) <= fr ? 0 : n.skidS - dirS * fr;
+        // friction depends on which way it's pointing vs where it's going: rolling straight on (rear-ended) it coasts,
+        // sliding sideways the tyres scrub hard. yaw = how far it's turned from the road
+        const sy = Math.abs(Math.sin(n.yaw * Math.PI / 180)), dirS = Math.sign(n.skidS || 0);
+        const frS = (1.2 + 6 * sy) * dt, fr = (1.2 + 6 * (1 - sy)) * dt;
+        n.skidS = Math.abs(n.skidS || 0) <= frS ? 0 : n.skidS - dirS * frS;
         if (n.skidS && occ.some(o => o.ref !== n && Math.abs(o.lat - n.lat) < 2 && (o.s - n.s) * dirS > 0 && (o.s - n.s) * dirS < (o.len + n.T.len) / 2 + 0.5)) n.skidS = 0;
         n.s += n.skidS * dt;
         n.vl = Math.abs(n.vl) <= fr ? 0 : n.vl - Math.sign(n.vl) * fr;
@@ -242,13 +245,7 @@ module.exports = function traffic({ online, clock, send }) {
           crash(A, closing, side * kick * mB / (mA + mB), why, vc); crash(B, closing, -side * kick * mA / (mA + mB), why, vc);
         }
       }
-      // an NPC driving into a player crashes too (the player gets shoved client-side)
-      for (const p of players) {
-        if (!onRoad(p)) continue;
-        for (const n of npcs.values())
-          if (n.crashT <= 0 && !(n.ghostT > 0) && Math.abs(n.lat - p.road.lat) < (n.T.wid + 1.8) / 2 - 0.2 && Math.abs(n.s - p.road.s) < (n.T.len + 4.4) / 2 - 0.5)
-            crash(n, Math.abs(n.v * n.lane - p.road.vs), Math.sign(n.lat - p.road.lat) * 1.5, 'into-player', (n.T.m * n.v * n.lane + p.road.vs) / (n.T.m + 1));
-      }
+      // NPC-into-player contacts are reported by that player's client (real mesh contact), not guessed here
     }
 
     // despawn: far from every player, off the start of the road, or nobody around.

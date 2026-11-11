@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 3;
+  const MOD_VERSION = 4;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -10,9 +10,9 @@
   const PROTO = 3;
   const CARS = ['coupe', 'coach', 'bike', 'drift'];
   const PICK = [['coupe', 'Coupe'], ['coach', 'Coach'], ['bike', 'Bike']]; // index = game's setVehicle index
-  const MASS = { coupe: 1, coach: 4, bike: 0.35, drift: 1 };
+  const MASS = { coupe: 1, coach: 4, bike: 1, drift: 1 }; // bikes count as solid as a car so cars stop on them instead of shoving through
   // max speed change (m/s) one contact can give you, per frame and in total. bikes balance/lean, so a big sideways kick flings them
-  const KICK = { coupe: [12, 30], coach: [12, 30], drift: [12, 30], bike: [3, 5] };
+  const KICK = { coupe: [12, 30], coach: [12, 30], drift: [12, 30], bike: [2.5, 10] };
   const DELAY = 100, EXTRAP = 250, CULL2 = 1500 ** 2, TAG_DIST = 800, REST = 0.3, REC = 29;
   const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
   const hashWorld = () => location.hash.slice(1).split('@')[0];
@@ -213,12 +213,15 @@
 
   // server-clock sync: offset = smallest (local - server) seen, re-measured every 5s
   let off = Infinity, winMin = Infinity, winStart = 0;
-  const onTick = dv => {
-    const now = performance.now(), st = dv.getUint32(1, true), n = dv.getUint16(5, true);
+  const syncClock = (now, st) => {
     const o0 = now - st;
     if (o0 < off) off = o0;
     if (o0 < winMin) winMin = o0;
     if (now - winStart > 5000) { off = winMin; winMin = Infinity; winStart = now; }
+  };
+  const onTick = dv => {
+    const now = performance.now(), st = dv.getUint32(1, true), n = dv.getUint16(5, true);
+    syncClock(now, st);
     for (let i = 0, o = 7; i < n; i++, o += REC) {
       const g = ghosts.get(dv.getUint16(o, true));
       if (!g) continue;
@@ -346,15 +349,183 @@
       if (ov <= 0) { g.kicked = 0; return; }
       if (ov < depth) { depth = ov; const sg = d < 0 ? -1 : 1; nx = lx * sg; nz = lz * sg; }
     }
+    const bike = car.type === 'bike';
     const [perFrame, perContact] = KICK[car.type] || KICK.coupe;
     const v = C.chassisVel, gv = g.vel || [0, 0, 0];
     const vr = (v.x - gv[0]) * nx + (v.z - gv[2]) * nz;
-    const target = Math.max(Math.min(depth, 1) * (car.type === 'bike' ? 1.5 : 3), -REST * vr);
+    const target = Math.max(Math.min(depth, 1) * (bike ? 2 : 3), bike ? 0 : -REST * vr); // bikes don't bounce
     if (vr >= target) return;
     const j = Math.min((target - vr) * MASS[g.type] / (MASS[car.type] + MASS[g.type]), perFrame, perContact - (g.kicked || 0));
     if (j <= 0) return;
     g.kicked = (g.kicked || 0) + j; // resets once you're apart, so one bump can't stack into a launch
-    v.x += nx * j; v.z += nz * j;
+    let ix = nx * j, iz = nz * j;
+    if (bike) {
+      // bikes balance: a sideways kick tips them into the game's crash/reset. push fully along the bike, gently across it,
+      // and never while airborne. small per-frame steps but no total cap, so you still can't be driven through
+      if (car.isAirborne) return;
+      const lon = ix * A.ux + iz * A.uz, lat = (ix * A.wx + iz * A.wz) * 0.45;
+      ix = A.ux * lon + A.wx * lat; iz = A.uz * lon + A.wz * lat;
+    }
+    v.x += ix; v.z += iz;
+  };
+
+  // ================= road =================
+  // the road is a linked list of nodes exactly 10m apart: {i, p (centre, Vector3), n {x,z} (unit normal), next, prev}.
+  // the autodriver always holds some of them, which is our way in. distance along the road: s = i * 10.
+  // every client builds the same road from the seed, so (s, lateral offset) means the same spot for everyone.
+  const NODE = 10;
+  const road = { by: new Map(), at: -1e9, near: null };
+  const roadRef = () => {
+    const ad = car?.controller?.autodriver;
+    return ad && (ad.midlineLookup?.n || ad.targetNode || ad.speedAnnotationNode || ad.bridgeLookaheadNode);
+  };
+  const refreshRoad = now => {
+    if (now - road.at < 1500) return road.by.size > 0;
+    road.at = now;
+    const r = roadRef();
+    if (!r?.p) return false;
+    let a = r, k = 0;
+    while (a.prev && k++ < 20000) a = a.prev;
+    road.by.clear();
+    for (let x = a; x && road.by.size < 20000; x = x.next) road.by.set(x.i, x);
+    return true;
+  };
+  // centre-line point + forward tangent at distance s (catmull-rom through the nodes), shifted sideways by lat
+  const RP = { x: 0, y: 0, z: 0, fx: 1, fy: 0, fz: 0 };
+  const roadPoint = (s, lat) => {
+    const u = s / NODE, i = Math.floor(u), f = u - i;
+    const b = road.by.get(i), c = road.by.get(i + 1);
+    if (!b || !c) return false;
+    const a = road.by.get(i - 1) || b, d = road.by.get(i + 2) || c;
+    const f2 = f * f, f3 = f2 * f;
+    const cr = (p0, p1, p2, p3) => 0.5 * (2 * p1 + (p2 - p0) * f + (2 * p0 - 5 * p1 + 4 * p2 - p3) * f2 + (3 * p1 - p0 - 3 * p2 + p3) * f3);
+    const dr = (p0, p1, p2, p3) => 0.5 * ((p2 - p0) + 2 * (2 * p0 - 5 * p1 + 4 * p2 - p3) * f + 3 * (3 * p1 - p0 - 3 * p2 + p3) * f2);
+    const ap = a.p, bp = b.p, cp = c.p, dp = d.p;
+    let fx = dr(ap.x, bp.x, cp.x, dp.x), fy = dr(ap.y, bp.y, cp.y, dp.y), fz = dr(ap.z, bp.z, cp.z, dp.z);
+    const fl = Math.hypot(fx, fy, fz) || 1;
+    fx /= fl; fy /= fl; fz /= fl;
+    const hl = Math.hypot(fx, fz) || 1, nx = -fz / hl, nz = fx / hl; // horizontal normal, same side as node.n
+    const sideSign = (b.n.x * nx + b.n.z * nz) < 0 ? -1 : 1;
+    RP.x = cr(ap.x, bp.x, cp.x, dp.x) + nx * lat * sideSign;
+    RP.y = cr(ap.y, bp.y, cp.y, dp.y);
+    RP.z = cr(ap.z, bp.z, cp.z, dp.z) + nz * lat * sideSign;
+    RP.fx = fx; RP.fy = fy; RP.fz = fz;
+    return true;
+  };
+  // where we are on the road: nearest node (walked from last time), then distance along + sideways offset
+  const myRoad = () => {
+    let n = road.near && road.by.get(road.near.i) === road.near ? road.near : roadRef();
+    if (!n?.p) return null;
+    const P = car.position, dist = x => (x.p.x - P.x) ** 2 + (x.p.z - P.z) ** 2;
+    for (let k = 0; k < 400; k++) {
+      const dn = n.next && dist(n.next) < dist(n) ? n.next : n.prev && dist(n.prev) < dist(n) ? n.prev : null;
+      if (!dn) break;
+      n = dn;
+    }
+    road.near = n;
+    const m = n.next || n, dx = m.p.x - n.p.x, dz = m.p.z - n.p.z, l = Math.hypot(dx, dz) || 1;
+    const rx = P.x - n.p.x, rz = P.z - n.p.z, lat = rx * n.n.x + rz * n.n.z;
+    if (Math.abs(lat) > 40) return null;
+    return { s: n.i * NODE + (rx * dx + rz * dz) / l, lat };
+  };
+
+  // ================= traffic =================
+  // the server runs a 1D traffic sim along the road and sends (s, speed, lateral, type, colour) per NPC 5x/sec.
+  // we predict between packets, place them on our copy of the road, and draw them all with InstancedMesh:
+  // one draw call per car part per type, no matter how many NPCs. no nametags, so you can tell them from players.
+  const npcs = new Map(), fleets = {};
+  const PALETTE = [[1, 1, 1], [0.75, 0.77, 0.8], [0.22, 0.23, 0.26], [0.85, 0.16, 0.12], [0.18, 0.33, 0.75], [0.2, 0.5, 0.3], [0.95, 0.75, 0.2], [0.55, 0.15, 0.4]];
+  const NPC_CULL2 = 1400 ** 2;
+  let IM = null, M4 = null, imChecked = false, lastNpcF = performance.now();
+  const findIM = () => {
+    if (imChecked) return IM;
+    imChecked = true;
+    for (const s of scenes) s.traverse(o => { if (!IM && o.isInstancedMesh) IM = o.constructor; });
+    M4 = car.matrix.constructor;
+    return IM;
+  };
+  const onTraffic = dv => {
+    const now = performance.now(), st = dv.getUint32(1, true), n = dv.getUint16(5, true);
+    syncClock(now, st);
+    for (let i = 0, o = 7; i < n; i++, o += 10) {
+      const id = dv.getUint16(o, true), s = dv.getFloat32(o + 2, true), vs = dv.getInt16(o + 6, true) / 100;
+      const lat = dv.getInt8(o + 8) / 40, fl = dv.getUint8(o + 9);
+      let N = npcs.get(id);
+      if (!N) npcs.set(id, N = { id, type: CARS[fl & 3] || 'coupe', color: (fl >> 2) & 7, rs: s, rlat: lat, dir: lat < 0 ? 1 : -1, box: { wi: 50000 + id }, vel: [0, 0, 0], kicked: 0 });
+      N.s = s; N.vs = vs; N.tlat = lat; N.t = st; N.seen = now;
+      if (Math.abs(vs) > 0.3) N.dir = Math.sign(vs);
+    }
+  };
+  const fleetFor = (type, need) => {
+    const M = models[type];
+    if (!M || !findIM()) return null;
+    let F = fleets[type];
+    if (F && F.M === M && F.cap >= need) return F;
+    if (F) for (const p of F.parts) { p.im.removeFromParent(); p.im.dispose(); }
+    const cap = Math.max(32, 2 ** Math.ceil(Math.log2(need || 1)));
+    const parts = [];
+    M.m.traverse(o => o.isMesh && parts.push({ g: o.geometry, mat: o.material, local: o.matrixWorld.clone(), name: o.name }));
+    let bi = parts.findIndex(p => /_map$|_metal_2$/.test(p.name));
+    if (bi < 0) bi = 0;
+    F = fleets[type] = { M, cap, parts: parts.map((p, k) => {
+      const im = new IM(p.g, p.mat, cap);
+      im.frustumCulled = false; im.count = 0; im.matrixAutoUpdate = false;
+      return { im, local: p.local, body: k === bi };
+    }) };
+    const Col = parts[bi].mat.color?.constructor;
+    F.colors = Col ? PALETTE.map(c => new Col(...c)) : null;
+    return F;
+  };
+  const NM = {};
+  const updateTraffic = (now, dt) => {
+    for (const F of Object.values(fleets)) for (const p of F.parts) p.im.count = 0;
+    if (!npcs.size || !refreshRoad(now)) return;
+    if (!NM.m) { NM.m = car.matrix.clone(); NM.t = car.matrix.clone(); NM.x = car.position.clone(); NM.y = car.position.clone(); NM.z = car.position.clone(); }
+    const counts = {}, srvNow = now - off;
+    for (const N of npcs.values()) {
+      if (now - N.seen > 1500) { npcs.delete(N.id); continue; }
+      const ps = N.s + N.vs * Math.max(0, Math.min(1, (srvNow - N.t) / 1000));
+      N.rs = Math.abs(ps - N.rs) > 30 ? ps : N.rs + (ps - N.rs) * Math.min(1, dt * 6);
+      N.rlat += (N.tlat - N.rlat) * Math.min(1, dt * 1.5); // lane changes / squeezing past take ~1-2s
+      N.near = false;
+      if (!roadPoint(N.rs, N.rlat)) continue;
+      const dx = RP.x - car.position.x, dz = RP.z - car.position.z, d2 = dx * dx + dz * dz;
+      if (d2 > NPC_CULL2) continue;
+      const M = models[N.type] || models.coupe;
+      if (!M) continue;
+      // basis: X = travel direction (follows slope), Y = up, Z = X × Y
+      const X = NM.x.set(RP.fx * N.dir, RP.fy * N.dir, RP.fz * N.dir);
+      const Y = NM.y.set(0, 1, 0).addScaledVector(X, -X.y).normalize();
+      const Z = NM.z.crossVectors(X, Y);
+      NM.m.makeBasis(X, Y, Z).setPosition(RP.x, RP.y, RP.z);
+      const type = models[N.type] ? N.type : 'coupe';
+      const idx = counts[type] = (counts[type] || 0) + 1;
+      const F = fleetFor(type, Math.max(idx, (fleets[type]?.cap || 0)));
+      if (!F) continue;
+      for (const p of F.parts) {
+        if (p.im.parent !== car.parent) car.parent.add(p.im);
+        NM.t.multiplyMatrices(NM.m, p.local);
+        p.im.setMatrixAt(idx - 1, NM.t);
+        if (p.body && F.colors) p.im.setColorAt(idx - 1, F.colors[N.color]);
+      }
+      N.vel[0] = RP.fx * N.vs; N.vel[1] = 0; N.vel[2] = RP.fz * N.vs;
+      if (joined && d2 < 900) { // close enough to touch: footprint for collisions
+        const B = N.box, hl = Math.hypot(X.x, X.z) || 1;
+        B.ux = X.x / hl; B.uz = X.z / hl; B.wx = -B.uz; B.wz = B.ux;
+        B.x = RP.x + B.ux * M.cx + Z.x * M.cz; B.z = RP.z + B.uz * M.cx + Z.z * M.cz; B.y = RP.y;
+        B.hx = M.hx; B.hz = M.hz; B.h = M.h;
+        N.near = true;
+      }
+    }
+    for (const [type, F] of Object.entries(fleets)) {
+      const c = counts[type] || 0;
+      for (const p of F.parts) {
+        p.im.count = c;
+        if (!c) continue;
+        p.im.instanceMatrix.needsUpdate = true;
+        if (p.body && p.im.instanceColor) p.im.instanceColor.needsUpdate = true;
+      }
+    }
   };
 
   const pre = () => {
@@ -386,6 +557,10 @@
         unstick(g);
       }
     }
+    const dt = Math.min((now - lastNpcF) / 1000, 0.1);
+    lastNpcF = now;
+    updateTraffic(now, dt);
+    for (const N of npcs.values()) if (N.near) { obstacles.push(N.box); unstick(N); }
   };
 
   const post = () => {
@@ -411,7 +586,7 @@
   };
 
   // ================= network =================
-  const out = new DataView(new ArrayBuffer(28));
+  const out = new DataView(new ArrayBuffer(34));
   const i16 = x => Math.max(-32767, Math.min(32767, Math.round(x)));
   let sentAt = 0, lp = [0, 0, 0], lq = [0, 0, 0, 0];
   setInterval(() => {
@@ -427,6 +602,10 @@
     out.setInt16(17, i16(q.z * 32767), true); out.setInt16(19, i16(q.w * 32767), true);
     out.setInt16(21, i16(v.x * 100), true); out.setInt16(23, i16(v.y * 100), true); out.setInt16(25, i16(v.z * 100), true);
     out.setUint8(27, Math.max(0, CARS.indexOf(car.type)));
+    // road position for traffic (NaN when we can't tell / off-road)
+    const r = refreshRoad(now) ? myRoad() : null;
+    out.setFloat32(28, r ? r.s : NaN, true);
+    out.setInt16(32, r ? i16(r.lat * 100) : 0, true);
     ws.send(out.buffer);
   }, 66);
 
@@ -434,9 +613,15 @@
     ws = new WebSocket(SERVER);
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', v: PROTO, name, car: carSel, mod: MOD_VERSION, loader: window.SRMP_LOADER || 0 }));
-    ws.onmessage = e => typeof e.data === 'string' ? onMsg(JSON.parse(e.data)) : e.data.byteLength >= 7 && new DataView(e.data).getUint8(0) === 2 && onTick(new DataView(e.data));
+    ws.onmessage = e => {
+      if (typeof e.data === 'string') return onMsg(JSON.parse(e.data));
+      if (e.data.byteLength < 7) return;
+      const dv = new DataView(e.data), op = dv.getUint8(0);
+      if (op === 2) onTick(dv); else if (op === 4) onTraffic(dv);
+    };
     ws.onclose = e => {
       clearGhosts();
+      npcs.clear();
       if (e.code >= 4000) { kicked = true; return say(e.reason || 'disconnected by server'); }
       if (!me) { // free hosts sleep when idle and take ~1 min to wake, keep knocking
         if (++wakeTries > 18) { wakeTries = 0; overlay?.classList.remove('auto'); return status("can't reach server"); }

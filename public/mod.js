@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 4;
+  const MOD_VERSION = 5;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -11,8 +11,6 @@
   const CARS = ['coupe', 'coach', 'bike', 'drift'];
   const PICK = [['coupe', 'Coupe'], ['coach', 'Coach'], ['bike', 'Bike']]; // index = game's setVehicle index
   const MASS = { coupe: 1, coach: 4, bike: 1, drift: 1 }; // bikes count as solid as a car so cars stop on them instead of shoving through
-  // max speed change (m/s) one contact can give you, per frame and in total. bikes balance/lean, so a big sideways kick flings them
-  const KICK = { coupe: [12, 30], coach: [12, 30], drift: [12, 30], bike: [2.5, 10] };
   const DELAY = 100, EXTRAP = 250, CULL2 = 1500 ** 2, TAG_DIST = 800, REST = 0.3, REC = 29;
   const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
   const hashWorld = () => location.hash.slice(1).split('@')[0];
@@ -179,7 +177,9 @@
       o.matrixAutoUpdate = false;
       if (!o.isMesh) return;
       o.geometry = o.geometry.clone();
-      o.material = Array.isArray(o.material) ? o.material.map(x => x.clone()) : o.material.clone();
+      // materials are shared with the game, NOT cloned: a clone loses slowroads' shader patch (onBeforeCompile), which is what
+      // darkens tyres/underbodies, so they'd render neon white. sharing was verified to render correctly with instancing
+      // (if the game disposes them on a vehicle swap, three.js just re-uploads them on next use)
       if (/shadow/i.test(o.name)) return;
       o.geometry.computeBoundingBox();
       const b = o.geometry.boundingBox;
@@ -332,33 +332,56 @@
     Object.defineProperty(gs, '__srmp', { value: true });
   };
 
+  // crash feedback on the first frame of a contact: the game's own impact sound, and tell the server we hit an NPC
+  const onImpact = (g, cv, x, y, z) => {
+    if (cv < 2) return;
+    const C = car.controller;
+    C.collisionStrength = Math.max(C.collisionStrength || 0, Math.min(1, cv / 15));
+    C.collisionPos?.set?.(x, y + 0.5, z);
+    if (g.isNpc && ws?.readyState === 1) ws.send(JSON.stringify({ t: 'hit', id: g.id, v: +cv.toFixed(1) }));
+  };
+
   // body-vs-body impulse: head-on/rear-end hits, overlaps the wheels can't see, spawning inside someone.
   // drives relative normal speed toward a target (bounce + gentle separation) so it never stacks frame to frame
   const A = {};
   const unstick = g => {
     const MA = models[car.type], B = g.box, C = car.controller;
-    if (!MA || !C?.chassisVel) return;
+    if (!MA || !C?.chassisVel) { g.contact = false; return; }
     box(car.position, car.quaternion, MA, A);
-    if (Math.abs(A.y - B.y) > Math.max(A.h, B.h) + 0.5) return;
+    if (Math.abs(A.y - B.y) > Math.max(A.h, B.h) + 0.5) { g.contact = false; return; }
     const dx = A.x - B.x, dz = A.z - B.z;
     let depth = Infinity, nx = 0, nz = 0;
     for (const [lx, lz] of [[A.ux, A.uz], [A.wx, A.wz], [B.ux, B.uz], [B.wx, B.wz]]) {
       const ra = A.hx * Math.abs(A.ux * lx + A.uz * lz) + A.hz * Math.abs(A.wx * lx + A.wz * lz);
       const rb = B.hx * Math.abs(B.ux * lx + B.uz * lz) + B.hz * Math.abs(B.wx * lx + B.wz * lz);
       const d = dx * lx + dz * lz, ov = ra + rb - Math.abs(d);
-      if (ov <= 0) { g.kicked = 0; return; }
+      if (ov <= 0) { g.contact = false; return; }
       if (ov < depth) { depth = ov; const sg = d < 0 ? -1 : 1; nx = lx * sg; nz = lz * sg; }
     }
     const bike = car.type === 'bike';
-    const [perFrame, perContact] = KICK[car.type] || KICK.coupe;
     const v = C.chassisVel, gv = g.vel || [0, 0, 0];
     const vr = (v.x - gv[0]) * nx + (v.z - gv[2]) * nz;
-    const target = Math.max(Math.min(depth, 1) * (bike ? 2 : 3), bike ? 0 : -REST * vr); // bikes don't bounce
+    // share of the impulse we take: NPCs are server-driven and don't get pushed, so we take most of it
+    const k = g.isNpc ? 0.8 : MASS[g.type] / (MASS[car.type] + MASS[g.type]);
+    const rest = bike ? 0 : g.isNpc ? 0.15 : REST;
+    if (!g.contact) { // first frame of this contact: remember how hard it was, crash effects
+      g.contact = true; g.kicked = 0; g.spun = 0; g.cv = Math.max(0, -vr);
+      onImpact(g, g.cv, (A.x + B.x) / 2, A.y, (A.z + B.z) / 2);
+    }
+    // enough budget to actually stop you (closing speed, plus bounce) but nothing extra: no stacking into a launch
+    const budget = g.cv * (1 + rest) * k + 4;
+    const target = Math.max(Math.min(depth, 1) * (bike ? 2 : 3), -rest * vr);
     if (vr >= target) return;
-    const j = Math.min((target - vr) * MASS[g.type] / (MASS[car.type] + MASS[g.type]), perFrame, perContact - (g.kicked || 0));
+    const j = Math.min((target - vr) * k, bike ? 8 : 12, budget - g.kicked); // per-frame cap spreads a big hit over a few frames
     if (j <= 0) return;
-    g.kicked = (g.kicked || 0) + j; // resets once you're apart, so one bump can't stack into a launch
+    g.kicked += j;
     let ix = nx * j, iz = nz * j;
+    // spin: an off-centre hit twists the car (cars only, bikes would just fall over)
+    if (!bike && C.chassisRotVel && g.spun < 2.5) {
+      const rx = (B.x - A.x) / 2, rz = (B.z - A.z) / 2, I = (A.hx * A.hx + A.hz * A.hz) / 3;
+      const dw = Math.max(-1.2, Math.min(1.2, (rz * ix - rx * iz) / I * 0.5));
+      C.chassisRotVel.y += dw; g.spun += Math.abs(dw);
+    }
     if (bike) {
       // bikes balance: a sideways kick tips them into the game's crash/reset. push fully along the bike, gently across it,
       // and never while airborne. small per-frame steps but no total cap, so you still can't be driven through
@@ -444,16 +467,18 @@
     M4 = car.matrix.constructor;
     return IM;
   };
+  // op 6: per NPC 11 bytes: id u16, s f32, speed along road i16 (cm/s), lateral i8 (/40 m), flags u8, yaw i8 (*1.5 deg)
+  // flags: bits 0-1 type, 2-4 colour, 5 braking, 6 wrecked, 7 drives toward -s
   const onTraffic = dv => {
     const now = performance.now(), st = dv.getUint32(1, true), n = dv.getUint16(5, true);
     syncClock(now, st);
-    for (let i = 0, o = 7; i < n; i++, o += 10) {
+    for (let i = 0, o = 7; i < n; i++, o += 11) {
       const id = dv.getUint16(o, true), s = dv.getFloat32(o + 2, true), vs = dv.getInt16(o + 6, true) / 100;
-      const lat = dv.getInt8(o + 8) / 40, fl = dv.getUint8(o + 9);
+      const lat = dv.getInt8(o + 8) / 40, fl = dv.getUint8(o + 9), yaw = dv.getInt8(o + 10) * 1.5 * Math.PI / 180;
       let N = npcs.get(id);
-      if (!N) npcs.set(id, N = { id, type: CARS[fl & 3] || 'coupe', color: (fl >> 2) & 7, rs: s, rlat: lat, dir: lat < 0 ? 1 : -1, box: { wi: 50000 + id }, vel: [0, 0, 0], kicked: 0 });
-      N.s = s; N.vs = vs; N.tlat = lat; N.t = st; N.seen = now;
-      if (Math.abs(vs) > 0.3) N.dir = Math.sign(vs);
+      if (!N) npcs.set(id, N = { id, isNpc: true, type: CARS[fl & 3] || 'coupe', color: (fl >> 2) & 7, rs: s, rlat: lat, ryaw: yaw, box: { wi: 50000 + id }, vel: [0, 0, 0] });
+      N.s = s; N.vs = vs; N.tlat = lat; N.t = st; N.seen = now; N.tyaw = yaw;
+      N.dir = fl & 128 ? -1 : 1; N.wreck = !!(fl & 64);
     }
   };
   const fleetFor = (type, need) => {
@@ -486,7 +511,8 @@
       if (now - N.seen > 1500) { npcs.delete(N.id); continue; }
       const ps = N.s + N.vs * Math.max(0, Math.min(1, (srvNow - N.t) / 1000));
       N.rs = Math.abs(ps - N.rs) > 30 ? ps : N.rs + (ps - N.rs) * Math.min(1, dt * 6);
-      N.rlat += (N.tlat - N.rlat) * Math.min(1, dt * 1.5); // lane changes / squeezing past take ~1-2s
+      N.rlat += (N.tlat - N.rlat) * Math.min(1, dt * (N.wreck ? 6 : 1.5)); // lane changes take ~1-2s, a crash shunt is quick
+      N.ryaw += (N.tyaw - N.ryaw) * Math.min(1, dt * (N.wreck ? 7 : 2));    // wrecks spin out fast, recover slowly
       N.near = false;
       if (!roadPoint(N.rs, N.rlat)) continue;
       const dx = RP.x - car.position.x, dz = RP.z - car.position.z, d2 = dx * dx + dz * dz;
@@ -495,6 +521,7 @@
       if (!M) continue;
       // basis: X = travel direction (follows slope), Y = up, Z = X × Y
       const X = NM.x.set(RP.fx * N.dir, RP.fy * N.dir, RP.fz * N.dir);
+      if (Math.abs(N.ryaw) > 0.001) { const c = Math.cos(N.ryaw), sn = Math.sin(N.ryaw), x = X.x; X.x = x * c + X.z * sn; X.z = -x * sn + X.z * c; }
       const Y = NM.y.set(0, 1, 0).addScaledVector(X, -X.y).normalize();
       const Z = NM.z.crossVectors(X, Y);
       NM.m.makeBasis(X, Y, Z).setPosition(RP.x, RP.y, RP.z);
@@ -555,12 +582,12 @@
       if (joined && d2 < 900) {
         obstacles.push(box(g.root.position, g.root.quaternion, M, g.box));
         unstick(g);
-      }
+      } else g.contact = false;
     }
     const dt = Math.min((now - lastNpcF) / 1000, 0.1);
     lastNpcF = now;
     updateTraffic(now, dt);
-    for (const N of npcs.values()) if (N.near) { obstacles.push(N.box); unstick(N); }
+    for (const N of npcs.values()) if (N.near) { obstacles.push(N.box); unstick(N); } else N.contact = false;
   };
 
   const post = () => {
@@ -617,7 +644,7 @@
       if (typeof e.data === 'string') return onMsg(JSON.parse(e.data));
       if (e.data.byteLength < 7) return;
       const dv = new DataView(e.data), op = dv.getUint8(0);
-      if (op === 2) onTick(dv); else if (op === 4) onTraffic(dv);
+      if (op === 2) onTick(dv); else if (op === 6) onTraffic(dv);
     };
     ws.onclose = e => {
       clearGhosts();

@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 7;
+  const MOD_VERSION = 8;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -396,14 +396,27 @@
   const refreshRoad = now => {
     if (now - road.at < 1500) return road.by.size > 0;
     road.at = now;
-    const r = roadRef();
-    if (!r?.p) return false;
-    let a = r, k = 0;
-    while (a.prev && k++ < 20000) a = a.prev;
+    // the autodriver holds several nodes; one can be a node the game already trimmed off (dead end), so walk from each
+    // and keep the longest live list
+    const ad = car?.controller?.autodriver;
+    const refs = ad ? [ad.midlineLookup?.n, ad.targetNode, ad.speedAnnotationNode, ad.bridgeLookaheadNode, road.near] : [];
+    let best = null, bestLen = 0;
+    for (const r of refs) {
+      if (!r?.p) continue;
+      let a = r, k = 0;
+      while (a.prev && k++ < 20000) a = a.prev;
+      let len = 0;
+      for (let x = a; x && len < 20000; x = x.next) len++;
+      if (len > bestLen) { bestLen = len; best = a; }
+    }
+    if (!best) return road.by.size > 0;
     road.by.clear();
-    for (let x = a; x && road.by.size < 20000; x = x.next) {
+    for (let x = best; x && road.by.size < 20000; x = x.next) {
       road.by.set(x.i, x);
-      if (!roadHist.has(x.i)) { roadHist.set(x.i, [x.p.x, x.p.z]); if (x.i < histMin) histMin = x.i; if (x.i > histMax) histMax = x.i; }
+      // the game keeps smoothing fresh road near its head for a while, so live nodes always overwrite the history
+      const h = roadHist.get(x.i);
+      if (h) { h[0] = x.p.x; h[1] = x.p.z; }
+      else { roadHist.set(x.i, [x.p.x, x.p.z]); if (x.i < histMin) histMin = x.i; if (x.i > histMax) histMax = x.i; }
     }
     return true;
   };
@@ -841,11 +854,17 @@
     }, 30000);
     if (!isReady()) return status('game failed to load, refresh');
 
+    // never touch the vehicle while slowroads is still loading the environment: a vehicle swap mid-load can break its
+    // terrain load queue (invisible terrain). wait for the loading screen to go and things to settle first
+    const gameLoading = () => /\bLOADING\b/.test(document.body?.innerText || '');
+    await until(() => !gameLoading(), 90000);
+    await wait(1500);
     status('loading cars...');
     for (const [i, [key]] of PICK.entries()) {
       if (models[key]) continue;
+      if (gameLoading()) await until(() => !gameLoading(), 30000);
       car.setVehicle(i);
-      await until(() => isReady() && car.type === key, 15000);
+      await until(() => isReady() && car.type === key && !gameLoading(), 15000);
       if (!isReady() || car.type !== key) break;
       snap();
     }

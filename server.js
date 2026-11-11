@@ -33,6 +33,34 @@ const MOD = (() => {
   } catch { return null; }
 })();
 
+// tampermonkey/violentmonkey version: same config + loader + mod as the extension, glued into one userscript that points at
+// whichever server served it. built at startup so it can never drift from the extension
+const USERSCRIPT = (() => {
+  try {
+    const read = f => fs.readFileSync(path.join(PUB, f), 'utf8');
+    const loaderV = +(read('config.js').match(/SRMP_LOADER = (\d+)/) || [])[1] || 1;
+    const config = read('config.js').replace(/window\.SRMP_SERVER = '[^']*';/, `window.SRMP_SERVER = '${PUBLIC_URL.replace(/^http/, 'ws')}';`);
+    return `// ==UserScript==
+// @name         slowroads multiplayer
+// @namespace    slowroads-mp
+// @version      ${MOD?.mod || 0}.${loaderV}
+// @description  multiplayer, traffic and crashes for slowroads.io (unofficial)
+// @match        https://slowroads.io/*
+// @run-at       document-start
+// @grant        none
+// @inject-into  page
+// @sandbox      raw
+// @updateURL    ${PUBLIC_URL}/slowroads-mp.user.js
+// @downloadURL  ${PUBLIC_URL}/slowroads-mp.user.js
+// ==/UserScript==
+
+window.SRMP_USERSCRIPT = true;
+${config}
+${read('loader.js')}
+${read('mod.js')}`;
+  } catch { return null; }
+})();
+
 const players = new Map(); // ws -> player
 const bans = new Set((process.env.BANS || '').split(',').map(s => s.trim()).filter(Boolean)), perIp = new Map();
 const t0 = Date.now(), clock = () => Date.now() - t0;
@@ -59,6 +87,11 @@ const server = http.createServer((req, res) => {
     if (!MOD) { res.writeHead(404, cors).end(); return; }
     if (req.url === '/version') res.writeHead(200, { ...cors, 'content-type': 'application/json' }).end(JSON.stringify({ mod: MOD.mod, loader: MOD.loader }));
     else res.writeHead(200, { ...cors, 'content-type': 'text/javascript; charset=utf-8' }).end(MOD.code);
+    return;
+  }
+  if (req.url === '/slowroads-mp.user.js') {
+    if (!USERSCRIPT) { res.writeHead(404).end(); return; }
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-cache' }).end(USERSCRIPT);
     return;
   }
   if (req.url === '/extension.zip') {
@@ -94,7 +127,11 @@ wss.on('connection', (ws, req) => {
     if (++p.msgs > 60) return kick(p, 'spam');
     if (p.msgs > 30) return;
     if (!p.name) return bin ? ws.close(4004, 'bad hello') : hello(p, data);
-    if (bin && (data.length === 28 || data.length === 34) && data[0] === 1) state(p, data);
+    if (bin && (data.length === 28 || data.length === 34) && data[0] === 1) return state(p, data);
+    if (!bin && data.length < 120) { // small json events after join: hit reports for traffic crashes
+      let m; try { m = JSON.parse(data); } catch { return; }
+      if (m.t === 'hit') traffic.hit(p, m.id | 0, +m.v);
+    }
   });
 
   ws.on('close', () => {

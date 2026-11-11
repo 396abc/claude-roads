@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 5;
+  const MOD_VERSION = 6;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -10,8 +10,7 @@
   const PROTO = 3;
   const CARS = ['coupe', 'coach', 'bike', 'drift'];
   const PICK = [['coupe', 'Coupe'], ['coach', 'Coach'], ['bike', 'Bike']]; // index = game's setVehicle index
-  const MASS = { coupe: 1, coach: 4, bike: 1, drift: 1 }; // bikes count as solid as a car so cars stop on them instead of shoving through
-  const DELAY = 100, EXTRAP = 250, CULL2 = 1500 ** 2, TAG_DIST = 800, REST = 0.3, REC = 29;
+  const DELAY = 100, EXTRAP = 250, CULL2 = 1500 ** 2, TAG_DIST = 800, REC = 29;
   const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
   const hashWorld = () => location.hash.slice(1).split('@')[0];
 
@@ -180,7 +179,8 @@
       // materials are shared with the game, NOT cloned: a clone loses slowroads' shader patch (onBeforeCompile), which is what
       // darkens tyres/underbodies, so they'd render neon white. sharing was verified to render correctly with instancing
       // (if the game disposes them on a vehicle swap, three.js just re-uploads them on next use)
-      if (/shadow/i.test(o.name)) return;
+      // hitbox = the solid body only: shadows and light/glow meshes (headlight beams etc.) reach well past the car
+      if (/shadow|light|lamp|glow|flare|beam|indicator|window/i.test(o.name)) return;
       o.geometry.computeBoundingBox();
       const b = o.geometry.boundingBox;
       for (let i = 0; i < 8; i++) {
@@ -189,7 +189,9 @@
         mx[0] = Math.max(mx[0], v.x); mx[1] = Math.max(mx[1], v.y); mx[2] = Math.max(mx[2], v.z);
       }
     });
-    models[car.type] = { m, cx: (mn[0] + mx[0]) / 2, cz: (mn[2] + mx[2]) / 2, hx: (mx[0] - mn[0]) / 2, hz: (mx[2] - mn[2]) / 2, h: mx[1] };
+    if (mn[0] > mx[0]) { mn[0] = -1; mn[1] = 0; mn[2] = -0.8; mx[0] = 3; mx[1] = 1.3; mx[2] = 0.8; } // nothing measurable: sane default
+    // trimmed slightly so boxes sit just inside the visible body (rounded corners, mirrors) rather than bulging past it
+    models[car.type] = { m, cx: (mn[0] + mx[0]) / 2, cz: (mn[2] + mx[2]) / 2, hx: (mx[0] - mn[0]) / 2 * 0.94, hz: (mx[2] - mn[2]) / 2 * 0.9, h: mx[1] };
   };
   const modelFor = t => models[t] || models.coupe || Object.values(models)[0];
 
@@ -265,71 +267,13 @@
     g.vel = u < 0.5 ? a.v : c.v;
   };
 
-  // 2D oriented-box overlap (SAT) on the ground plane, then a soft impulse on our own chassis velocity
+  // footprint of a car: oriented box on the ground plane from its pose + model bounds
   const box = (pos, quat, M, o) => {
     V.t.set(M.cx, 0, M.cz).applyQuaternion(quat);
     o.x = pos.x + V.t.x; o.z = pos.z + V.t.z; o.y = pos.y;
     V.t.set(1, 0, 0).applyQuaternion(quat); let l = Math.hypot(V.t.x, V.t.z) || 1; o.ux = V.t.x / l; o.uz = V.t.z / l;
     o.wx = -o.uz; o.wz = o.ux; o.hx = M.hx; o.hz = M.hz; o.h = M.h;
     return o;
-  };
-  // ---- ghost cars as barriers inside slowroads' own physics ----
-  // every wheel's ground query writes into wheel.groundState: w (wall present), wd (signed distance), wn (normal), ws (side), wi (wall id).
-  // those fields become accessors: when a ghost box is nearer than any road barrier, the wheel sees the ghost's nearest face as a
-  // barrier, so the game's own collideWallEdge pushes the wheel, its solver carries the chassis, and the hit/scrape sounds play.
-  const obstacles = [], myBox = { ok: false }, WALL_RANGE = 1.2;
-  const hookWheel = e => {
-    const gs = e.groundState;
-    if (!gs || gs.__srmp) return;
-    const raw = { w: gs.w, wd: gs.wd, wn: gs.wn, ws: gs.ws, wi: gs.wi };
-    const o = { on: false, wd: 0, wn: null, wi: 0, dirty: true };
-    const q = () => {
-      if (!o.dirty) return o.on;
-      o.dirty = false;
-      const was = o.on;
-      o.on = false;
-      const p = e.contactPoint;
-      if (!joined || !p || !obstacles.length || !myBox.ok || car.type === 'bike') return false; // bike: impulse only
-      let best = WALL_RANGE, hit = null, nx = 0, nz = 0;
-      for (const b of obstacles) {
-        if (Math.abs(p.y - b.y) > b.h + 1) continue;
-        const dx = p.x - b.x, dz = p.z - b.z;
-        const lu = dx * b.ux + dz * b.uz, lw = dx * b.wx + dz * b.wz;
-        const qx = Math.abs(lu) - b.hx, qz = Math.abs(lw) - b.hz, ox = Math.max(qx, 0), oz = Math.max(qz, 0);
-        let gu, gw;
-        if (ox > 0 || oz > 0) { gu = ox * Math.sign(lu); gw = oz * Math.sign(lw); }
-        else if (qx > qz) { gu = Math.sign(lu); gw = 0; } else { gu = 0; gw = Math.sign(lw); }
-        const l = Math.hypot(gu, gw) || 1, mx = (gu * b.ux + gw * b.wx) / l, mz = (gu * b.uz + gw * b.wz) / l;
-        // wheels sit inside the body: shift the wall out by how far our own body reaches past this wheel toward the ghost
-        const A = myBox, reach = (A.x - p.x) * -mx + (A.z - p.z) * -mz + A.hx * Math.abs(A.ux * mx + A.uz * mz) + A.hz * Math.abs(A.wx * mx + A.wz * mz);
-        const sdf = Math.hypot(ox, oz) + Math.min(Math.max(qx, qz), 0) - Math.max(reach, 0);
-        if (sdf >= best) continue;
-        best = sdf; hit = b; nx = mx; nz = mz;
-      }
-      if (!hit) return false;
-      // the game's wall response slides the wheel by wcd*tan(impact angle): fine for barriers you graze, but a nose-first
-      // hit is ~90° and tan blows up and flings you. only feed it glancing contacts; the impulse solver below does the rest
-      if (best < (was ? -0.8 : 0)) return false;                    // first touch from inside / deep (spawn, teleport): impulse handles it
-      if (e.wi === hit.wi && e.insideWall === false) return false;  // game thinks we're past it, never trap a wheel
-      if (raw.w && raw.wd > -best) return false;                    // a real barrier is closer
-      const vd = e.velocityDir, glancing = vd && Math.abs(vd.x * nz - vd.z * nx) >= 0.7;
-      o.on = true; o.wi = hit.wi;
-      // nose-first: keep the wall registered with the wheel safely outside (no push, impulse handles it) so the game's
-      // inside/outside state stays right; glancing: real distance, small per-frame push (verlet turns push into speed)
-      o.wd = glancing ? Math.min(-best, -0.12) : -Math.max(best, 0.3); // push per frame = wd + margin(0.2) <= 8cm
-      (o.wn ||= car.position.clone()).set(nx, 0, nz);
-      return true;
-    };
-    const def = (k, get) => Object.defineProperty(gs, k, {
-      configurable: true, enumerable: true, get,
-      set(v) { raw[k] = v; if (k === 'w') o.dirty = true; }
-    });
-    def('w', () => q() || raw.w);
-    def('wd', () => (q() ? o.wd : raw.wd));
-    def('wn', () => (q() ? o.wn : raw.wn));
-    def('ws', () => (q() ? 1 : raw.ws));
-    def('wi', () => (q() ? o.wi : raw.wi));
-    Object.defineProperty(gs, '__srmp', { value: true });
   };
 
   // crash feedback on the first frame of a contact: the game's own impact sound, and tell the server we hit an NPC
@@ -341,14 +285,18 @@
     if (g.isNpc && ws?.readyState === 1) ws.send(JSON.stringify({ t: 'hit', id: g.id, v: +cv.toFixed(1) }));
   };
 
-  // body-vs-body impulse: head-on/rear-end hits, overlaps the wheels can't see, spawning inside someone.
-  // drives relative normal speed toward a target (bounce + gentle separation) so it never stacks frame to frame
-  const A = {};
-  const unstick = g => {
+  // ---- collisions: a contact constraint, like a physics engine does it ----
+  // boxes overlap (SAT) -> along the contact normal we only ever REMOVE the speed you're driving into the other car with
+  // (inelastic, no bounce), plus a tiny capped nudge apart if still overlapping. nothing is ever added on top, so a hit
+  // can stop you or carry you along with whatever hit you, but it can't launch you. scraping along a car adds a bit of
+  // friction, off-centre hits add a little spin. NPCs are server-driven and solid, so you resolve all of it; with another
+  // player each side resolves half (their client does the other half).
+  const A = {}, SEP = 1;
+  const collide = g => {
     const MA = models[car.type], B = g.box, C = car.controller;
-    if (!MA || !C?.chassisVel) { g.contact = false; return; }
+    if (!MA || !C?.chassisVel || car.isAirborne) { g.contact = false; return; }
     box(car.position, car.quaternion, MA, A);
-    if (Math.abs(A.y - B.y) > Math.max(A.h, B.h) + 0.5) { g.contact = false; return; }
+    if (Math.abs(A.y - B.y) > Math.max(A.h, B.h) + 0.3) { g.contact = false; return; }
     const dx = A.x - B.x, dz = A.z - B.z;
     let depth = Infinity, nx = 0, nz = 0;
     for (const [lx, lz] of [[A.ux, A.uz], [A.wx, A.wz], [B.ux, B.uz], [B.wx, B.wz]]) {
@@ -356,40 +304,39 @@
       const rb = B.hx * Math.abs(B.ux * lx + B.uz * lz) + B.hz * Math.abs(B.wx * lx + B.wz * lz);
       const d = dx * lx + dz * lz, ov = ra + rb - Math.abs(d);
       if (ov <= 0) { g.contact = false; return; }
-      if (ov < depth) { depth = ov; const sg = d < 0 ? -1 : 1; nx = lx * sg; nz = lz * sg; }
+      if (ov < depth) { depth = ov; const sg = d < 0 ? -1 : 1; nx = lx * sg; nz = lz * sg; } // normal points from them to us
     }
-    const bike = car.type === 'bike';
-    const v = C.chassisVel, gv = g.vel || [0, 0, 0];
-    const vr = (v.x - gv[0]) * nx + (v.z - gv[2]) * nz;
-    // share of the impulse we take: NPCs are server-driven and don't get pushed, so we take most of it
-    const k = g.isNpc ? 0.8 : MASS[g.type] / (MASS[car.type] + MASS[g.type]);
-    const rest = bike ? 0 : g.isNpc ? 0.15 : REST;
-    if (!g.contact) { // first frame of this contact: remember how hard it was, crash effects
-      g.contact = true; g.kicked = 0; g.spun = 0; g.cv = Math.max(0, -vr);
-      onImpact(g, g.cv, (A.x + B.x) / 2, A.y, (A.z + B.z) / 2);
+    const v = C.chassisVel, gv = g.vel || [0, 0, 0], share = g.isNpc ? 1 : 0.5;
+    const rx = v.x - gv[0], rz = v.z - gv[2], vr = rx * nx + rz * nz; // vr < 0: closing
+    if (!g.contact) { g.contact = true; g.spun = 0; g.used = 0; g.cv = Math.max(0, -vr); onImpact(g, g.cv, (A.x + B.x) / 2, A.y, (A.z + B.z) / 2); }
+
+    // normal: bring relative speed up to "barely separating" (never more than SEP m/s apart).
+    // vs a player we only take our fair half of the hit's closing speed in total (they take theirs), so a rear-end leaves both
+    // cars rolling at about half speed instead of you stopping dead and them getting launched. once that's spent, a slow
+    // 0.5 m/s-per-frame push still stops you sinking into a car that keeps shoving
+    const target = Math.min(depth * 2, SEP);
+    let j = vr < target ? (target - vr) * share : 0;
+    if (!g.isNpc && j > 0) {
+      const left = g.cv * share + SEP - g.used;
+      j = left > 0 ? Math.min(j, left) : Math.min(j, 0.5);
+      g.used += j;
     }
-    // enough budget to actually stop you (closing speed, plus bounce) but nothing extra: no stacking into a launch
-    const budget = g.cv * (1 + rest) * k + 4;
-    const target = Math.max(Math.min(depth, 1) * (bike ? 2 : 3), -rest * vr);
-    if (vr >= target) return;
-    const j = Math.min((target - vr) * k, bike ? 8 : 12, budget - g.kicked); // per-frame cap spreads a big hit over a few frames
-    if (j <= 0) return;
-    g.kicked += j;
     let ix = nx * j, iz = nz * j;
-    // spin: an off-centre hit twists the car (cars only, bikes would just fall over)
-    if (!bike && C.chassisRotVel && g.spun < 2.5) {
-      const rx = (B.x - A.x) / 2, rz = (B.z - A.z) / 2, I = (A.hx * A.hx + A.hz * A.hz) / 3;
-      const dw = Math.max(-1.2, Math.min(1.2, (rz * ix - rx * iz) / I * 0.5));
-      C.chassisRotVel.y += dw; g.spun += Math.abs(dw);
-    }
-    if (bike) {
-      // bikes balance: a sideways kick tips them into the game's crash/reset. push fully along the bike, gently across it,
-      // and never while airborne. small per-frame steps but no total cap, so you still can't be driven through
-      if (car.isAirborne) return;
-      const lon = ix * A.ux + iz * A.uz, lat = (ix * A.wx + iz * A.wz) * 0.45;
+    // tangential: scraping along the other car bleeds a little speed
+    const tx = rx - nx * vr, tz = rz - nz * vr;
+    ix -= tx * 0.04 * share; iz -= tz * 0.04 * share;
+    if (car.type === 'bike') { // a hard sideways shove tips a bike into the game's crash-reset: halve the across-the-bike part
+      const lon = ix * A.ux + iz * A.uz, lat = (ix * A.wx + iz * A.wz) * 0.5;
       ix = A.ux * lon + A.wx * lat; iz = A.uz * lon + A.wz * lat;
     }
     v.x += ix; v.z += iz;
+
+    // spin from an off-centre hit (cars only, bikes would just fall over), capped per contact
+    if (car.type !== 'bike' && C.chassisRotVel && j > 0.5 && g.spun < 0.6) {
+      const cx = (B.x - A.x) / 2, cz = (B.z - A.z) / 2, I = (A.hx * A.hx + A.hz * A.hz) / 3;
+      const dw = Math.max(-0.3, Math.min(0.3, (cz * ix - cx * iz) / I * 0.35));
+      C.chassisRotVel.y += dw; g.spun += Math.abs(dw);
+    }
   };
 
   // ================= road =================
@@ -563,11 +510,7 @@
       if (C?.fly) C.fly.up = C.fly.right = C.fly.back = 0; // debug fly mode
       if (car.type === 'debug' && isReady()) car.setVehicle(0);
     }
-    if (C?.wheels) for (const w of C.wheels) hookWheel(w);
     const now = performance.now(), rt = now - off - DELAY;
-    obstacles.length = 0;
-    myBox.ok = !!models[car.type];
-    if (myBox.ok) box(car.position, car.quaternion, models[car.type], myBox);
     for (const g of ghosts.values()) {
       const live = g.buf.length && now - g.last < 5000;
       if (!live) { if (g.root) g.root.visible = false; continue; }
@@ -579,15 +522,12 @@
       sample(g, rt);
       const d2 = g.root.position.distanceToSquared(car.position);
       g.root.visible = d2 < CULL2;
-      if (joined && d2 < 900) {
-        obstacles.push(box(g.root.position, g.root.quaternion, M, g.box));
-        unstick(g);
-      } else g.contact = false;
+      if (joined && d2 < 900) { box(g.root.position, g.root.quaternion, M, g.box); collide(g); } else g.contact = false;
     }
     const dt = Math.min((now - lastNpcF) / 1000, 0.1);
     lastNpcF = now;
     updateTraffic(now, dt);
-    for (const N of npcs.values()) if (N.near) { obstacles.push(N.box); unstick(N); } else N.contact = false;
+    for (const N of npcs.values()) if (N.near) collide(N); else N.contact = false;
   };
 
   const post = () => {

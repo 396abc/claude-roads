@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 8;
+  const MOD_VERSION = 9;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -312,14 +312,25 @@
     if (g.isNpc && ws?.readyState === 1) ws.send(JSON.stringify({ t: 'hit', id: g.id, v: +cv.toFixed(1) }));
   };
 
-  // move our car sideways without touching its speed: every position the physics keeps (body, centre of mass, previous
-  // positions, wheels) shifts together, so the solver's position->velocity maths sees no motion. verified live in slowroads
+  // our car's physics state, for both kinds of vehicle in slowroads:
+  //   cars: a chassis with chassisVel (+ chassisPComPos etc.)
+  //   bikes: NO chassis velocity at all - two wheels integrated verlet-style, velocity = (worldPos - pWorldPos) / pdT
+  // nudge() moves the car without touching its speed: every position the physics keeps shifts together, so the solver's
+  // position->velocity maths sees no motion. addVel() changes its speed. both verified live in slowroads (car + bike)
+  const isBikeCtl = C => !C.chassisVel && C.wheels?.length;
   const nudge = (dx, dz) => {
-    const C = car.controller, add = v => { if (v) { v.x += dx; v.z += dz; } };
+    const C = car.controller, add = v => { if (v?.isVector3) { v.x += dx; v.z += dz; } };
     add(car.position); add(car.pPosition); add(car.com);
     add(C.comPos); add(C.comPosLerped); add(C.chassisPComPos); add(C.chassisCandidatePos); add(C.chassisCandidateComPos);
-    if (C.wheels) for (const w of C.wheels) { add(w.worldPos); add(w.pWorldPos); add(w.contactPoint); }
+    if (C.wheels) for (const w of C.wheels) { add(w.worldPos); add(w.pWorldPos); add(w.contactPoint); if (isBikeCtl(C)) { add(w.groundPoint); add(w.tPos); } }
   };
+  const addVel = (dx, dz) => {
+    const C = car.controller;
+    if (C.chassisVel) { C.chassisVel.x += dx; C.chassisVel.z += dz; return; }
+    const dt = C.pdT || 1 / 60;
+    for (const w of C.wheels) { w.pWorldPos.x -= dx * dt; w.pWorldPos.z -= dz * dt; }
+  };
+  const myVel = () => car.controller.chassisVel || car.velocity;
 
   // ---- collisions: solid bodies ----
   // footprints are the convex hulls of the actual meshes. when they overlap (SAT) we
@@ -330,7 +341,7 @@
   const PA = [], PB = [], ME = {};
   const collide = g => {
     const MA = models[car.type], C = car.controller, P2 = g.pose;
-    if (!MA || !P2?.M || !C?.chassisVel || car.isAirborne) { g.contact = false; return; }
+    if (!MA || !P2?.M || !C || !(C.chassisVel || C.wheels?.length) || car.isAirborne) { g.contact = false; return; }
     const P1 = poseFromQuat(car.position, car.quaternion, MA, ME);
     if (Math.abs(P1.y - P2.y) > Math.max(MA.h, P2.M.h) + 0.3) { g.contact = false; return; }
     const A = worldPoly(P1, PA), B = worldPoly(P2, PB);
@@ -354,7 +365,7 @@
     cAx /= A.length; cAz /= A.length; cBx /= B.length; cBz /= B.length;
     if ((cAx - cBx) * nx + (cAz - cBz) * nz < 0) { nx = -nx; nz = -nz; }
 
-    const v = C.chassisVel, gv = g.vel || [0, 0, 0], share = g.isNpc ? 1 : 0.5, bike = car.type === 'bike';
+    const v = myVel(), gv = g.vel || [0, 0, 0], share = g.isNpc ? 1 : 0.5, bike = car.type === 'bike' || isBikeCtl(C);
     const rx = v.x - gv[0], rz = v.z - gv[2], vr = rx * nx + rz * nz; // vr < 0: closing
     if (!g.contact) { g.contact = true; g.spun = 0; g.used = 0; g.cv = Math.max(0, -vr); onImpact(g, g.cv, (cAx + cBx) / 2, P1.y, (cAz + cBz) / 2); }
 
@@ -374,7 +385,7 @@
       const lon = ix * fx + iz * fz, lat = (ix * -fz + iz * fx) * 0.5;
       ix = fx * lon - fz * lat; iz = fz * lon + fx * lat;
     }
-    v.x += ix; v.z += iz;
+    addVel(ix, iz);
     // a little spin from off-centre hits (cars only), capped per contact
     if (!bike && C.chassisRotVel && j > 0.5 && g.spun < 0.6) {
       const ox = (cBx - cAx) / 2, oz = (cBz - cAz) / 2, I = (MA.hx * MA.hx + MA.hz * MA.hz) / 3;
@@ -523,6 +534,14 @@
       N.rlat += (pl - N.rlat) * Math.min(1, dt * 8);
       N.rvl += (N.vl - N.rvl) * Math.min(1, dt * 6);
       N.ryaw += (N.tyaw - N.ryaw) * Math.min(1, dt * (N.wreck ? 7 : 2)); // wrecks spin out fast, recover slowly
+      // walls: where the game has barriers on this stretch, NPCs (skidding wrecks, swerves) stop at them instead of passing
+      // through. it's the game's own road data and identical for everyone, so every client stops them in the same place
+      const Mw = models[N.type] || models.coupe, nb = road.by.get(Math.floor(N.rs / NODE));
+      if (Mw && nb) {
+        const ys = Math.abs(Math.sin(N.ryaw)), hw = ys * Mw.hx + (1 - ys) * Mw.hz + 0.1; // wider when spun sideways
+        if (nb.rWallDist && N.rlat > nb.rWallDist - hw) N.rlat = nb.rWallDist - hw;
+        if (nb.lWallDist && N.rlat < hw - nb.lWallDist) N.rlat = hw - nb.lWallDist;
+      }
       N.near = false;
       if (!roadPoint(N.rs, N.rlat)) continue;
       const dx = RP.x - car.position.x, dz = RP.z - car.position.z, d2 = dx * dx + dz * dz;

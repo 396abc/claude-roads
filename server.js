@@ -234,6 +234,22 @@ const traffic = require('./traffic')({
   send: (p, buf) => p.ws.readyState === 1 && p.ws.bufferedAmount < 65536 && p.ws.send(buf)
 });
 
+// map feed: every player's position to everyone once a second, no distance limit, so the minimap never loses anyone.
+// op 7, per player 12 bytes: id u16, x f32, z f32, facing x/z i8 (unit vector *127)
+setInterval(() => {
+  const list = online().filter(p => p.pos);
+  if (!list.length) return;
+  const buf = Buffer.allocUnsafe(3 + list.length * 12);
+  buf[0] = 7; buf.writeUInt16LE(list.length, 1);
+  list.forEach((p, i) => {
+    const o = 3 + i * 12, q = [13, 15, 17, 19].map(k => p.rec.readInt16LE(k + 1) / 32767);
+    const [x, y, z, w] = q, fx = 1 - 2 * (y * y + z * z), fz = 2 * (x * z - w * y), fl = Math.hypot(fx, fz) || 1;
+    buf.writeUInt16LE(p.id, o); buf.writeFloatLE(p.pos[0], o + 2); buf.writeFloatLE(p.pos[2], o + 6);
+    buf.writeInt8(Math.round(fx / fl * 127), o + 10); buf.writeInt8(Math.round(fz / fl * 127), o + 11);
+  });
+  for (const r of list) if (r.ws.readyState === 1 && r.ws.bufferedAmount < 65536) r.ws.send(buf);
+}, 1000);
+
 setInterval(() => { for (const p of players.values()) p.msgs = 0; }, 1000);
 setInterval(() => { for (const p of players.values()) p.speedHits = Math.max(0, p.speedHits - 100); }, 30000);
 setInterval(() => {

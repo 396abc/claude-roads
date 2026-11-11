@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 6;
+  const MOD_VERSION = 7;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -108,7 +108,7 @@
   // ---- camera tilt: the game already orbits sideways on left-drag; vertical drag (mouse or touch) now tilts too.
   // touch drags also orbit sideways. applied only for the frame's render, then undone, so the game's camera smoothing never sees it
   let tilt = 0, tiltT = 0, yawT = 0, yaw = 0, drag = null, lastF = performance.now();
-  const onCanvas = e => e.target?.tagName === 'CANVAS';
+  const onCanvas = e => e.target?.tagName === 'CANVAS' && e.target !== MM.big; // not while dragging the full map
   addEventListener('pointerdown', e => {
     if (overlay || !onCanvas(e) || (e.pointerType === 'mouse' && e.button !== 0)) return;
     drag = { id: e.pointerId, x: e.clientX, y: e.clientY, touch: e.pointerType !== 'mouse' };
@@ -171,7 +171,7 @@
     m.traverse(o => (o.isLight || (o.isMesh && /interior|dash|steer/i.test(o.name))) && drop.push(o));
     drop.forEach(o => o.removeFromParent());
     m.updateMatrixWorld(true);
-    const v = car.position.clone(), mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
+    const v = car.position.clone(), pts = [], ys = [];
     m.traverse(o => {
       o.matrixAutoUpdate = false;
       if (!o.isMesh) return;
@@ -181,17 +181,35 @@
       // (if the game disposes them on a vehicle swap, three.js just re-uploads them on next use)
       // hitbox = the solid body only: shadows and light/glow meshes (headlight beams etc.) reach well past the car
       if (/shadow|light|lamp|glow|flare|beam|indicator|window/i.test(o.name)) return;
-      o.geometry.computeBoundingBox();
-      const b = o.geometry.boundingBox;
-      for (let i = 0; i < 8; i++) {
-        v.set(i & 1 ? b.max.x : b.min.x, i & 2 ? b.max.y : b.min.y, i & 4 ? b.max.z : b.min.z).applyMatrix4(o.matrixWorld);
-        mn[0] = Math.min(mn[0], v.x); mn[1] = Math.min(mn[1], v.y); mn[2] = Math.min(mn[2], v.z);
-        mx[0] = Math.max(mx[0], v.x); mx[1] = Math.max(mx[1], v.y); mx[2] = Math.max(mx[2], v.z);
-      }
+      const pos = o.geometry.attributes.position, step = Math.max(1, Math.floor(pos.count / 1500));
+      for (let i = 0; i < pos.count; i += step) { v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld); pts.push([v.x, v.z]); ys.push(v.y); }
     });
-    if (mn[0] > mx[0]) { mn[0] = -1; mn[1] = 0; mn[2] = -0.8; mx[0] = 3; mx[1] = 1.3; mx[2] = 0.8; } // nothing measurable: sane default
-    // trimmed slightly so boxes sit just inside the visible body (rounded corners, mirrors) rather than bulging past it
-    models[car.type] = { m, cx: (mn[0] + mx[0]) / 2, cz: (mn[2] + mx[2]) / 2, hx: (mx[0] - mn[0]) / 2 * 0.94, hz: (mx[2] - mn[2]) / 2 * 0.9, h: mx[1] };
+    // footprint = 2D convex hull of the real mesh (seen from above), simplified to <=16 corners: a coupe's rounded nose,
+    // a bus's long box, a bike's thin sliver. ys give its height range
+    let hull = pts.length > 2 ? convexHull(pts) : [[-1, -0.8], [3, -0.8], [3, 0.8], [-1, 0.8]];
+    while (hull.length > 16) { // drop the corner that changes the shape least
+      let best = 0, bestA = Infinity;
+      for (let i = 0; i < hull.length; i++) {
+        const a = hull[(i + hull.length - 1) % hull.length], b = hull[i], c = hull[(i + 1) % hull.length];
+        const area = Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]));
+        if (area < bestA) { bestA = area; best = i; }
+      }
+      hull.splice(best, 1);
+    }
+    const xs = hull.map(p => p[0]), zs = hull.map(p => p[1]);
+    const mnx = Math.min(...xs), mxx = Math.max(...xs), mnz = Math.min(...zs), mxz = Math.max(...zs);
+    const ymax = ys.length ? Math.max(...ys) : 1.3;
+    models[car.type] = { m, hull, cx: (mnx + mxx) / 2, cz: (mnz + mxz) / 2, hx: (mxx - mnx) / 2, hz: (mxz - mnz) / 2, h: ymax };
+  };
+  // monotone-chain convex hull of [x,z] points, counter-clockwise
+  const convexHull = P => {
+    P = P.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lo = [], hi = [];
+    for (const p of P) { while (lo.length > 1 && cross(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+    for (let i = P.length - 1; i >= 0; i--) { const p = P[i]; while (hi.length > 1 && cross(hi[hi.length - 2], hi[hi.length - 1], p) <= 0) hi.pop(); hi.push(p); }
+    lo.pop(); hi.pop();
+    return lo.concat(hi);
   };
   const modelFor = t => models[t] || models.coupe || Object.values(models)[0];
 
@@ -202,7 +220,7 @@
     tag.className = 'srmp-tag';
     tag.textContent = p.name;
     tag.style.display = 'none';
-    ghosts.set(p.id, { box: { wi: 60000 + p.id }, name: p.name, type: CARS[p.c] || 'coupe', tag, buf: [], pool: [], last: 0, shown: false, tx: 0, ty: 0, op: 0 });
+    ghosts.set(p.id, { pose: {}, name: p.name, type: CARS[p.c] || 'coupe', tag, buf: [], pool: [], last: 0, shown: false, tx: 0, ty: 0, op: 0 });
   };
   const removePlayer = id => {
     const g = ghosts.get(id);
@@ -267,13 +285,22 @@
     g.vel = u < 0.5 ? a.v : c.v;
   };
 
-  // footprint of a car: oriented box on the ground plane from its pose + model bounds
-  const box = (pos, quat, M, o) => {
-    V.t.set(M.cx, 0, M.cz).applyQuaternion(quat);
-    o.x = pos.x + V.t.x; o.z = pos.z + V.t.z; o.y = pos.y;
-    V.t.set(1, 0, 0).applyQuaternion(quat); let l = Math.hypot(V.t.x, V.t.z) || 1; o.ux = V.t.x / l; o.uz = V.t.z / l;
-    o.wx = -o.uz; o.wz = o.ux; o.hx = M.hx; o.hz = M.hz; o.h = M.h;
+  // pose = where a car sits on the ground plane: position + its local X (forward) and Z (side) axes, plus its model
+  const poseFromQuat = (pos, quat, M, o) => {
+    V.t.set(1, 0, 0).applyQuaternion(quat); o.ax = V.t.x; o.az = V.t.z;
+    V.t.set(0, 0, 1).applyQuaternion(quat); o.bx = V.t.x; o.bz = V.t.z;
+    o.x = pos.x; o.y = pos.y; o.z = pos.z; o.M = M;
     return o;
+  };
+  // its real footprint (hull of the mesh) placed in the world
+  const worldPoly = (P, out) => {
+    const h = P.M.hull;
+    out.length = h.length;
+    for (let i = 0; i < h.length; i++) {
+      const p = h[i], q = out[i] || (out[i] = [0, 0]);
+      q[0] = P.x + P.ax * p[0] + P.bx * p[1]; q[1] = P.z + P.az * p[0] + P.bz * p[1];
+    }
+    return out;
   };
 
   // crash feedback on the first frame of a contact: the game's own impact sound, and tell the server we hit an NPC
@@ -285,56 +312,73 @@
     if (g.isNpc && ws?.readyState === 1) ws.send(JSON.stringify({ t: 'hit', id: g.id, v: +cv.toFixed(1) }));
   };
 
-  // ---- collisions: a contact constraint, like a physics engine does it ----
-  // boxes overlap (SAT) -> along the contact normal we only ever REMOVE the speed you're driving into the other car with
-  // (inelastic, no bounce), plus a tiny capped nudge apart if still overlapping. nothing is ever added on top, so a hit
-  // can stop you or carry you along with whatever hit you, but it can't launch you. scraping along a car adds a bit of
-  // friction, off-centre hits add a little spin. NPCs are server-driven and solid, so you resolve all of it; with another
-  // player each side resolves half (their client does the other half).
-  const A = {}, SEP = 1;
-  const collide = g => {
-    const MA = models[car.type], B = g.box, C = car.controller;
-    if (!MA || !C?.chassisVel || car.isAirborne) { g.contact = false; return; }
-    box(car.position, car.quaternion, MA, A);
-    if (Math.abs(A.y - B.y) > Math.max(A.h, B.h) + 0.3) { g.contact = false; return; }
-    const dx = A.x - B.x, dz = A.z - B.z;
-    let depth = Infinity, nx = 0, nz = 0;
-    for (const [lx, lz] of [[A.ux, A.uz], [A.wx, A.wz], [B.ux, B.uz], [B.wx, B.wz]]) {
-      const ra = A.hx * Math.abs(A.ux * lx + A.uz * lz) + A.hz * Math.abs(A.wx * lx + A.wz * lz);
-      const rb = B.hx * Math.abs(B.ux * lx + B.uz * lz) + B.hz * Math.abs(B.wx * lx + B.wz * lz);
-      const d = dx * lx + dz * lz, ov = ra + rb - Math.abs(d);
-      if (ov <= 0) { g.contact = false; return; }
-      if (ov < depth) { depth = ov; const sg = d < 0 ? -1 : 1; nx = lx * sg; nz = lz * sg; } // normal points from them to us
-    }
-    const v = C.chassisVel, gv = g.vel || [0, 0, 0], share = g.isNpc ? 1 : 0.5;
-    const rx = v.x - gv[0], rz = v.z - gv[2], vr = rx * nx + rz * nz; // vr < 0: closing
-    if (!g.contact) { g.contact = true; g.spun = 0; g.used = 0; g.cv = Math.max(0, -vr); onImpact(g, g.cv, (A.x + B.x) / 2, A.y, (A.z + B.z) / 2); }
+  // move our car sideways without touching its speed: every position the physics keeps (body, centre of mass, previous
+  // positions, wheels) shifts together, so the solver's position->velocity maths sees no motion. verified live in slowroads
+  const nudge = (dx, dz) => {
+    const C = car.controller, add = v => { if (v) { v.x += dx; v.z += dz; } };
+    add(car.position); add(car.pPosition); add(car.com);
+    add(C.comPos); add(C.comPosLerped); add(C.chassisPComPos); add(C.chassisCandidatePos); add(C.chassisCandidateComPos);
+    if (C.wheels) for (const w of C.wheels) { add(w.worldPos); add(w.pWorldPos); add(w.contactPoint); }
+  };
 
-    // normal: bring relative speed up to "barely separating" (never more than SEP m/s apart).
-    // vs a player we only take our fair half of the hit's closing speed in total (they take theirs), so a rear-end leaves both
-    // cars rolling at about half speed instead of you stopping dead and them getting launched. once that's spent, a slow
-    // 0.5 m/s-per-frame push still stops you sinking into a car that keeps shoving
-    const target = Math.min(depth * 2, SEP);
-    let j = vr < target ? (target - vr) * share : 0;
-    if (!g.isNpc && j > 0) {
-      const left = g.cv * share + SEP - g.used;
-      j = left > 0 ? Math.min(j, left) : Math.min(j, 0.5);
-      g.used += j;
+  // ---- collisions: solid bodies ----
+  // footprints are the convex hulls of the actual meshes. when they overlap (SAT) we
+  //   1. push our car straight back out of the overlap by moving its position (solid: no sinking in, and no speed added)
+  //   2. remove only the speed we're driving INTO them with (inelastic, no bounce): a hit stops you or carries you along
+  //   3. bleed a little speed when scraping, add a little spin for off-centre hits
+  // NPCs are server-driven and solid, so we resolve all of it; vs a player each side resolves half (their client does theirs)
+  const PA = [], PB = [], ME = {};
+  const collide = g => {
+    const MA = models[car.type], C = car.controller, P2 = g.pose;
+    if (!MA || !P2?.M || !C?.chassisVel || car.isAirborne) { g.contact = false; return; }
+    const P1 = poseFromQuat(car.position, car.quaternion, MA, ME);
+    if (Math.abs(P1.y - P2.y) > Math.max(MA.h, P2.M.h) + 0.3) { g.contact = false; return; }
+    const A = worldPoly(P1, PA), B = worldPoly(P2, PB);
+    let depth = Infinity, nx = 0, nz = 0;
+    for (const poly of [A, B]) {
+      for (let i = 0; i < poly.length; i++) {
+        const p = poly[i], q = poly[(i + 1) % poly.length];
+        let ax = q[1] - p[1], az = p[0] - q[0];
+        const l = Math.hypot(ax, az); if (l < 1e-6) continue; ax /= l; az /= l;
+        let a0 = Infinity, a1 = -Infinity, b0 = Infinity, b1 = -Infinity;
+        for (const r of A) { const d = r[0] * ax + r[1] * az; if (d < a0) a0 = d; if (d > a1) a1 = d; }
+        for (const r of B) { const d = r[0] * ax + r[1] * az; if (d < b0) b0 = d; if (d > b1) b1 = d; }
+        const ov = Math.min(a1, b1) - Math.max(a0, b0);
+        if (ov <= 0) { g.contact = false; return; }
+        if (ov < depth) { depth = ov; nx = ax; nz = az; }
+      }
     }
+    // normal points from them to us
+    let cAx = 0, cAz = 0, cBx = 0, cBz = 0;
+    for (const r of A) { cAx += r[0]; cAz += r[1]; } for (const r of B) { cBx += r[0]; cBz += r[1]; }
+    cAx /= A.length; cAz /= A.length; cBx /= B.length; cBz /= B.length;
+    if ((cAx - cBx) * nx + (cAz - cBz) * nz < 0) { nx = -nx; nz = -nz; }
+
+    const v = C.chassisVel, gv = g.vel || [0, 0, 0], share = g.isNpc ? 1 : 0.5, bike = car.type === 'bike';
+    const rx = v.x - gv[0], rz = v.z - gv[2], vr = rx * nx + rz * nz; // vr < 0: closing
+    if (!g.contact) { g.contact = true; g.spun = 0; g.used = 0; g.cv = Math.max(0, -vr); onImpact(g, g.cv, (cAx + cBx) / 2, P1.y, (cAz + cBz) / 2); }
+
+    // 1. solid: step out of the overlap (deep overlaps from spawns/teleports resolve over a few frames, not one jump)
+    const push = Math.min(depth * share + 0.005, 0.5);
+    nudge(nx * push, nz * push);
+
+    // 2. inelastic: cancel our share of the closing speed (vs a player: our fair half of the hit in total)
+    let j = vr < 0 ? -vr * share : 0;
+    if (!g.isNpc && j > 0) { const left = g.cv * share + 0.5 - g.used; j = Math.min(j, Math.max(left, 0.3)); g.used += j; }
     let ix = nx * j, iz = nz * j;
-    // tangential: scraping along the other car bleeds a little speed
+    // 3. scraping friction
     const tx = rx - nx * vr, tz = rz - nz * vr;
     ix -= tx * 0.04 * share; iz -= tz * 0.04 * share;
-    if (car.type === 'bike') { // a hard sideways shove tips a bike into the game's crash-reset: halve the across-the-bike part
-      const lon = ix * A.ux + iz * A.uz, lat = (ix * A.wx + iz * A.wz) * 0.5;
-      ix = A.ux * lon + A.wx * lat; iz = A.uz * lon + A.wz * lat;
+    if (bike) { // a hard sideways shove tips a bike into the game's crash-reset: halve the across-the-bike part
+      const fl = Math.hypot(P1.ax, P1.az) || 1, fx = P1.ax / fl, fz = P1.az / fl;
+      const lon = ix * fx + iz * fz, lat = (ix * -fz + iz * fx) * 0.5;
+      ix = fx * lon - fz * lat; iz = fz * lon + fx * lat;
     }
     v.x += ix; v.z += iz;
-
-    // spin from an off-centre hit (cars only, bikes would just fall over), capped per contact
-    if (car.type !== 'bike' && C.chassisRotVel && j > 0.5 && g.spun < 0.6) {
-      const cx = (B.x - A.x) / 2, cz = (B.z - A.z) / 2, I = (A.hx * A.hx + A.hz * A.hz) / 3;
-      const dw = Math.max(-0.3, Math.min(0.3, (cz * ix - cx * iz) / I * 0.35));
+    // a little spin from off-centre hits (cars only), capped per contact
+    if (!bike && C.chassisRotVel && j > 0.5 && g.spun < 0.6) {
+      const ox = (cBx - cAx) / 2, oz = (cBz - cAz) / 2, I = (MA.hx * MA.hx + MA.hz * MA.hz) / 3;
+      const dw = Math.max(-0.3, Math.min(0.3, (oz * ix - ox * iz) / I * 0.35));
       C.chassisRotVel.y += dw; g.spun += Math.abs(dw);
     }
   };
@@ -357,7 +401,10 @@
     let a = r, k = 0;
     while (a.prev && k++ < 20000) a = a.prev;
     road.by.clear();
-    for (let x = a; x && road.by.size < 20000; x = x.next) road.by.set(x.i, x);
+    for (let x = a; x && road.by.size < 20000; x = x.next) {
+      road.by.set(x.i, x);
+      if (!roadHist.has(x.i)) { roadHist.set(x.i, [x.p.x, x.p.z]); if (x.i < histMin) histMin = x.i; if (x.i > histMax) histMax = x.i; }
+    }
     return true;
   };
   // centre-line point + forward tangent at distance s (catmull-rom through the nodes), shifted sideways by lat
@@ -379,7 +426,7 @@
     RP.x = cr(ap.x, bp.x, cp.x, dp.x) + nx * lat * sideSign;
     RP.y = cr(ap.y, bp.y, cp.y, dp.y);
     RP.z = cr(ap.z, bp.z, cp.z, dp.z) + nz * lat * sideSign;
-    RP.fx = fx; RP.fy = fy; RP.fz = fz;
+    RP.fx = fx; RP.fy = fy; RP.fz = fz; RP.nx = nx * sideSign; RP.nz = nz * sideSign;
     return true;
   };
   // where we are on the road: nearest node (walked from last time), then distance along + sideways offset
@@ -414,17 +461,17 @@
     M4 = car.matrix.constructor;
     return IM;
   };
-  // op 6: per NPC 11 bytes: id u16, s f32, speed along road i16 (cm/s), lateral i8 (/40 m), flags u8, yaw i8 (*1.5 deg)
-  // flags: bits 0-1 type, 2-4 colour, 5 braking, 6 wrecked, 7 drives toward -s
+  // op 8: per NPC 12 bytes: id u16, s f32, speed along road i16 (cm/s), lateral i8 (/35 m), lateral speed i8 (/20 m/s),
+  // flags u8, yaw i8 (*1.5 deg). flags: bits 0-1 type, 2-4 colour, 5 braking, 6 wrecked, 7 drives toward -s
   const onTraffic = dv => {
     const now = performance.now(), st = dv.getUint32(1, true), n = dv.getUint16(5, true);
     syncClock(now, st);
-    for (let i = 0, o = 7; i < n; i++, o += 11) {
+    for (let i = 0, o = 7; i < n; i++, o += 12) {
       const id = dv.getUint16(o, true), s = dv.getFloat32(o + 2, true), vs = dv.getInt16(o + 6, true) / 100;
-      const lat = dv.getInt8(o + 8) / 40, fl = dv.getUint8(o + 9), yaw = dv.getInt8(o + 10) * 1.5 * Math.PI / 180;
+      const lat = dv.getInt8(o + 8) / 35, vl = dv.getInt8(o + 9) / 20, fl = dv.getUint8(o + 10), yaw = dv.getInt8(o + 11) * 1.5 * Math.PI / 180;
       let N = npcs.get(id);
-      if (!N) npcs.set(id, N = { id, isNpc: true, type: CARS[fl & 3] || 'coupe', color: (fl >> 2) & 7, rs: s, rlat: lat, ryaw: yaw, box: { wi: 50000 + id }, vel: [0, 0, 0] });
-      N.s = s; N.vs = vs; N.tlat = lat; N.t = st; N.seen = now; N.tyaw = yaw;
+      if (!N) npcs.set(id, N = { id, isNpc: true, type: CARS[fl & 3] || 'coupe', color: (fl >> 2) & 7, rs: s, rlat: lat, rvl: 0, ryaw: yaw, pose: {}, vel: [0, 0, 0] });
+      N.s = s; N.vs = vs; N.lat = lat; N.vl = vl; N.t = st; N.seen = now; N.tyaw = yaw;
       N.dir = fl & 128 ? -1 : 1; N.wreck = !!(fl & 64);
     }
   };
@@ -456,18 +503,23 @@
     const counts = {}, srvNow = now - off;
     for (const N of npcs.values()) {
       if (now - N.seen > 1500) { npcs.delete(N.id); continue; }
-      const ps = N.s + N.vs * Math.max(0, Math.min(1, (srvNow - N.t) / 1000));
+      // predict from the last packet (server sim is smooth: speed along the road + a steering-limited sideways speed)
+      const age = Math.max(0, Math.min(1, (srvNow - N.t) / 1000));
+      const ps = N.s + N.vs * age, pl = N.lat + N.vl * Math.min(age, 0.5);
       N.rs = Math.abs(ps - N.rs) > 30 ? ps : N.rs + (ps - N.rs) * Math.min(1, dt * 6);
-      N.rlat += (N.tlat - N.rlat) * Math.min(1, dt * (N.wreck ? 6 : 1.5)); // lane changes take ~1-2s, a crash shunt is quick
-      N.ryaw += (N.tyaw - N.ryaw) * Math.min(1, dt * (N.wreck ? 7 : 2));    // wrecks spin out fast, recover slowly
+      N.rlat += (pl - N.rlat) * Math.min(1, dt * 8);
+      N.rvl += (N.vl - N.rvl) * Math.min(1, dt * 6);
+      N.ryaw += (N.tyaw - N.ryaw) * Math.min(1, dt * (N.wreck ? 7 : 2)); // wrecks spin out fast, recover slowly
       N.near = false;
       if (!roadPoint(N.rs, N.rlat)) continue;
       const dx = RP.x - car.position.x, dz = RP.z - car.position.z, d2 = dx * dx + dz * dz;
       if (d2 > NPC_CULL2) continue;
       const M = models[N.type] || models.coupe;
       if (!M) continue;
-      // basis: X = travel direction (follows slope), Y = up, Z = X × Y
-      const X = NM.x.set(RP.fx * N.dir, RP.fy * N.dir, RP.fz * N.dir);
+      // basis: X = where it's actually heading = along the road + its sideways speed, so lane changes and dodges
+      // visibly steer (nose turns into the move) instead of sliding. Y = up, Z = X × Y
+      const sp = Math.max(Math.abs(N.vs), 2);
+      const X = NM.x.set(RP.fx * N.dir * sp + RP.nx * N.rvl, RP.fy * N.dir * sp, RP.fz * N.dir * sp + RP.nz * N.rvl).normalize();
       if (Math.abs(N.ryaw) > 0.001) { const c = Math.cos(N.ryaw), sn = Math.sin(N.ryaw), x = X.x; X.x = x * c + X.z * sn; X.z = -x * sn + X.z * c; }
       const Y = NM.y.set(0, 1, 0).addScaledVector(X, -X.y).normalize();
       const Z = NM.z.crossVectors(X, Y);
@@ -482,12 +534,11 @@
         p.im.setMatrixAt(idx - 1, NM.t);
         if (p.body && F.colors) p.im.setColorAt(idx - 1, F.colors[N.color]);
       }
-      N.vel[0] = RP.fx * N.vs; N.vel[1] = 0; N.vel[2] = RP.fz * N.vs;
-      if (joined && d2 < 900) { // close enough to touch: footprint for collisions
-        const B = N.box, hl = Math.hypot(X.x, X.z) || 1;
-        B.ux = X.x / hl; B.uz = X.z / hl; B.wx = -B.uz; B.wz = B.ux;
-        B.x = RP.x + B.ux * M.cx + Z.x * M.cz; B.z = RP.z + B.uz * M.cx + Z.z * M.cz; B.y = RP.y;
-        B.hx = M.hx; B.hz = M.hz; B.h = M.h;
+      N.vel[0] = RP.fx * N.vs + RP.nx * N.vl; N.vel[1] = 0; N.vel[2] = RP.fz * N.vs + RP.nz * N.vl;
+      N.wx = RP.x; N.wz = RP.z; N.mapT = now; // for the minimap
+      if (joined && d2 < 900) { // close enough to touch: real footprint pose for collisions
+        const P = N.pose;
+        P.x = RP.x; P.y = RP.y; P.z = RP.z; P.ax = X.x; P.az = X.z; P.bx = Z.x; P.bz = Z.z; P.M = M;
         N.near = true;
       }
     }
@@ -500,6 +551,143 @@
         if (p.body && p.im.instanceColor) p.im.instanceColor.needsUpdate = true;
       }
     }
+  };
+
+  // ================= minimap + full map =================
+  // the game unloads road far behind you, so every node we ever see is kept (just x,z: tiny) and the map can show your
+  // whole drive. players come from a once-a-second feed with no distance limit, so nobody drops off the map
+  const roadHist = new Map();
+  let histMin = Infinity, histMax = -Infinity;
+  const MM = { mini: null, mctx: null, big: null, bctx: null, open: false, scale: 0.05, cx: 0, cz: 0, follow: true, drag: null };
+  const onMapFeed = dv => {
+    const now = performance.now(), n = dv.getUint16(1, true);
+    for (let i = 0, o = 3; i < n; i++, o += 12) {
+      const g = ghosts.get(dv.getUint16(o, true));
+      if (!g) continue;
+      g.mx = dv.getFloat32(o + 2, true); g.mz = dv.getFloat32(o + 6, true);
+      g.mfx = dv.getInt8(o + 10) / 127; g.mfz = dv.getInt8(o + 11) / 127; g.mapT = now;
+    }
+  };
+  // players to draw: live ghost position when we have one, otherwise the map feed
+  const mapPlayers = now => {
+    const out = [];
+    for (const g of ghosts.values()) {
+      if (g.root?.visible && now - g.last < 2000) out.push({ x: g.root.position.x, z: g.root.position.z, name: g.name });
+      else if (g.mapT && now - g.mapT < 15000) out.push({ x: g.mx, z: g.mz, name: g.name });
+    }
+    return out;
+  };
+  // world -> screen. heading-up (minimap) uses our forward/right axes, north-up (full map) is plain x/z
+  const drawMap = (ctx, W, H, cx, cz, scale, heading, full) => {
+    if (!ctx) return;
+    const now = performance.now(), dpr = devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = full ? 'rgba(12,14,18,.92)' : 'rgba(12,14,18,.62)';
+    ctx.fillRect(0, 0, W, H);
+    const fx = heading ? heading[0] : 0, fz = heading ? heading[1] : -1, rx = heading ? heading[2] : 1, rz = heading ? heading[3] : 0;
+    const S = (x, z, o) => { const dx = x - cx, dz = z - cz; o[0] = W / 2 + (dx * rx + dz * rz) * scale; o[1] = H / 2 - (dx * fx + dz * fz) * scale; return o; };
+    const q = [0, 0];
+    // road
+    if (roadHist.size) {
+      const near = road.near?.i ?? 0, span = full ? Infinity : Math.ceil(Math.max(W, H) / scale / NODE);
+      const lo = Math.max(histMin, near - span), hi = Math.min(histMax, near + span);
+      const stride = Math.max(1, Math.floor(2 / (NODE * scale)));
+      ctx.strokeStyle = 'rgba(235,235,235,.85)'; ctx.lineWidth = full ? 2 : 3; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      let pen = false;
+      for (let i = lo; i <= hi; i += stride) {
+        const p = roadHist.get(i);
+        if (!p) { pen = false; continue; }
+        S(p[0], p[1], q);
+        if (pen) ctx.lineTo(q[0], q[1]); else { ctx.moveTo(q[0], q[1]); pen = true; }
+      }
+      ctx.stroke();
+    }
+    // traffic
+    ctx.fillStyle = 'rgba(160,165,175,.9)';
+    for (const N of npcs.values()) {
+      if (!N.mapT || now - N.mapT > 1000) continue;
+      S(N.wx, N.wz, q);
+      if (q[0] < -5 || q[1] < -5 || q[0] > W + 5 || q[1] > H + 5) continue;
+      ctx.fillRect(q[0] - 1.5, q[1] - 1.5, 3, 3);
+    }
+    // players
+    ctx.font = `${full ? 12 : 10}px Sono,monospace`; ctx.textAlign = 'center';
+    for (const p of mapPlayers(now)) {
+      S(p.x, p.z, q);
+      const ex = Math.max(8, Math.min(W - 8, q[0])), ey = Math.max(8, Math.min(H - 8, q[1])); // pinned to the edge if off-map
+      ctx.fillStyle = '#4fc3ff'; ctx.beginPath(); ctx.arc(ex, ey, full ? 5 : 4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.fillText(p.name, ex, ey - 8);
+    }
+    // us: arrow
+    if (car?.parent) {
+      S(car.position.x, car.position.z, q);
+      const f = car.forwardDir || V.t?.set(1, 0, 0).applyQuaternion(car.quaternion) || { x: 1, z: 0 };
+      let ax = f.x * rx + f.z * rz, ay = -(f.x * fx + f.z * fz); const al = Math.hypot(ax, ay) || 1; ax /= al; ay /= al;
+      const s = full ? 9 : 8;
+      ctx.fillStyle = '#ffd34f'; ctx.beginPath();
+      ctx.moveTo(q[0] + ax * s, q[1] + ay * s);
+      ctx.lineTo(q[0] - ax * s * 0.6 - ay * s * 0.6, q[1] - ay * s * 0.6 + ax * s * 0.6);
+      ctx.lineTo(q[0] - ax * s * 0.6 + ay * s * 0.6, q[1] - ay * s * 0.6 - ax * s * 0.6);
+      ctx.closePath(); ctx.fill();
+    }
+    if (full) {
+      ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.textAlign = 'left'; ctx.font = '12px Sono,monospace';
+      ctx.fillText('M / esc close · scroll zoom · drag pan · double-click recentre', 14, H - 14);
+    }
+  };
+  const sizeCanvas = (c, w, h) => { const d = devicePixelRatio || 1; if (c.width !== w * d) { c.width = w * d; c.height = h * d; } };
+  const MINI = 190;
+  const drawMaps = () => {
+    if (!joined || !car?.parent || !MM.mini) return;
+    MM.mini.style.display = MM.open ? 'none' : '';
+    if (!MM.open) {
+      sizeCanvas(MM.mini, MINI, MINI);
+      const f = car.forwardDir || V.t?.set(1, 0, 0).applyQuaternion(car.quaternion) || { x: 1, z: 0 };
+      const fl = Math.hypot(f.x, f.z) || 1, fx = f.x / fl, fz = f.z / fl;
+      drawMap(MM.mctx, MINI, MINI, car.position.x, car.position.z, MINI / 2 / 450, [fx, fz, -fz, fx], false);
+    } else {
+      const W = innerWidth, H = innerHeight;
+      sizeCanvas(MM.big, W, H);
+      if (MM.follow) { MM.cx = car.position.x; MM.cz = car.position.z; }
+      drawMap(MM.bctx, W, H, MM.cx, MM.cz, MM.scale, null, true);
+    }
+  };
+  setInterval(drawMaps, 100);
+  const toggleMap = force => {
+    MM.open = force ?? !MM.open;
+    MM.big.style.display = MM.open ? '' : 'none';
+    if (MM.open) { MM.follow = true; drawMaps(); }
+  };
+  addEventListener('keydown', e => {
+    if (overlay || !joined || e.repeat || e.ctrlKey || e.metaKey || e.altKey || e.target?.tagName === 'INPUT') return;
+    if (e.code === 'KeyM' || (e.code === 'Escape' && MM.open)) { e.stopImmediatePropagation(); e.preventDefault(); toggleMap(e.code === 'Escape' ? false : undefined); }
+  }, true);
+  const buildMaps = () => {
+    MM.mini = document.createElement('canvas');
+    MM.mini.style.cssText = `position:fixed;top:16px;right:16px;width:${MINI}px;height:${MINI}px;border-radius:14px;z-index:2147483644;pointer-events:none;display:none`;
+    MM.big = document.createElement('canvas');
+    MM.big.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;z-index:2147483646;display:none;cursor:grab';
+    MM.mctx = MM.mini.getContext('2d'); MM.bctx = MM.big.getContext('2d');
+    document.documentElement.append(MM.mini, MM.big);
+    MM.big.addEventListener('wheel', e => {
+      e.preventDefault();
+      const k = Math.exp(-e.deltaY * 0.0015), W = innerWidth, H = innerHeight;
+      // zoom around the cursor
+      const wx = MM.cx + (e.clientX - W / 2) / MM.scale, wz = MM.cz + (e.clientY - H / 2) / MM.scale;
+      MM.scale = Math.max(0.002, Math.min(4, MM.scale * k));
+      MM.cx = wx - (e.clientX - W / 2) / MM.scale; MM.cz = wz - (e.clientY - H / 2) / MM.scale;
+      MM.follow = false; drawMaps();
+    }, { passive: false });
+    MM.big.addEventListener('pointerdown', e => { MM.drag = { x: e.clientX, y: e.clientY }; MM.big.style.cursor = 'grabbing'; });
+    addEventListener('pointermove', e => {
+      if (!MM.drag) return;
+      MM.cx -= (e.clientX - MM.drag.x) / MM.scale; MM.cz -= (e.clientY - MM.drag.y) / MM.scale;
+      MM.drag = { x: e.clientX, y: e.clientY }; MM.follow = false; drawMaps();
+    });
+    addEventListener('pointerup', () => { MM.drag = null; if (MM.big) MM.big.style.cursor = 'grab'; });
+    MM.big.addEventListener('dblclick', () => { MM.follow = true; drawMaps(); });
   };
 
   const pre = () => {
@@ -522,7 +710,7 @@
       sample(g, rt);
       const d2 = g.root.position.distanceToSquared(car.position);
       g.root.visible = d2 < CULL2;
-      if (joined && d2 < 900) { box(g.root.position, g.root.quaternion, M, g.box); collide(g); } else g.contact = false;
+      if (joined && d2 < 900) { poseFromQuat(g.root.position, g.root.quaternion, M, g.pose); collide(g); } else g.contact = false;
     }
     const dt = Math.min((now - lastNpcF) / 1000, 0.1);
     lastNpcF = now;
@@ -584,7 +772,7 @@
       if (typeof e.data === 'string') return onMsg(JSON.parse(e.data));
       if (e.data.byteLength < 7) return;
       const dv = new DataView(e.data), op = dv.getUint8(0);
-      if (op === 2) onTick(dv); else if (op === 6) onTraffic(dv);
+      if (op === 2) onTick(dv); else if (op === 8) onTraffic(dv); else if (op === 7) onMapFeed(dv);
     };
     ws.onclose = e => {
       clearGhosts();
@@ -713,6 +901,7 @@
       <div class="cars">${PICK.map(([k, n]) => `<button data-k="${k}">${n}</button>`).join('')}</div>
       <button class="go">join</button><div class="st"></div></div>`;
     document.documentElement.append(tagsEl, overlay);
+    buildMaps();
 
     nameIn = overlay.querySelector('input');
     statusEl = overlay.querySelector('.st');

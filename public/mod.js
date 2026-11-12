@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 15;
+  const MOD_VERSION = 16;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -9,6 +9,147 @@
 
   const PROTO = 3;
   const CARS = ['coupe', 'coach', 'bike', 'drift'];
+  // <physics> copied verbatim from server/physics.js at build time: the same engine runs on both sides
+  const PHYS = (() => {
+// tiny 2D rigid-body engine for crashed / shoved NPCs, in road space (x = s along the road, y = lateral).
+// boxes with real mass + inertia, tyre grip (rolls easily, resists sliding sideways, resists spinning), impulse collisions
+// with restitution + friction + spin from off-centre hits, positional correction so nothing sinks in, and wall planes.
+// cheap: a handful of bodies, 4-axis SAT per nearby pair, 3 substeps per server tick.
+
+const G = 9.81;
+// kg. bike = bike + rider. grip: mu along the car (rolling/braking) and across it (tyres scrubbing sideways)
+const SPEC = {
+  0: { m: 1300, muL: 0.45, muS: 0.85 },   // coupe
+  1: { m: 12000, muL: 0.4, muS: 0.75 },   // coach
+  2: { m: 330, muL: 0.35, muS: 0.9 }      // bike (upright). knocked over it slides on its side: muL = muS = 0.55
+};
+const mass = c => (SPEC[c] || SPEC[0]).m;
+
+function body(x, y, a, vx, vy, w, T) {
+  const S = SPEC[T.c] || SPEC[0], hl = T.len / 2, hw = T.wid / 2;
+  return { x, y, a, vx, vy, w, hl, hw, m: S.m, im: 1 / S.m, iI: 12 / (S.m * (T.len ** 2 + T.wid ** 2)), muL: S.muL, muS: S.muS, bike: T.c === 2 };
+}
+
+const axes = b => { const c = Math.cos(b.a), s = Math.sin(b.a); return [c, s, -s, c]; }; // forward (fx,fy), right (rx,ry)
+function corners(b) {
+  const [fx, fy, rx, ry] = axes(b), out = [];
+  for (const [i, j] of [[1, 1], [1, -1], [-1, -1], [-1, 1]]) out.push([b.x + fx * b.hl * i + rx * b.hw * j, b.y + fy * b.hl * i + ry * b.hw * j]);
+  return out;
+}
+const inside = (b, p) => {
+  const [fx, fy, rx, ry] = axes(b), dx = p[0] - b.x, dy = p[1] - b.y;
+  return Math.abs(dx * fx + dy * fy) <= b.hl + 0.02 && Math.abs(dx * rx + dy * ry) <= b.hw + 0.02;
+};
+
+// SAT between two boxes. returns { nx, ny (from A to B), depth, px, py (contact point) } or null
+function contact(A, B) {
+  if (Math.abs(A.x - B.x) > A.hl + B.hl + 1 || Math.abs(A.y - B.y) > A.hl + B.hl + 1) return null;
+  const CA = corners(A), CB = corners(B), [a1, a2, a3, a4] = axes(A), [b1, b2, b3, b4] = axes(B);
+  let depth = Infinity, nx = 0, ny = 0;
+  for (const [ax, ay] of [[a1, a2], [a3, a4], [b1, b2], [b3, b4]]) {
+    let mnA = Infinity, mxA = -Infinity, mnB = Infinity, mxB = -Infinity;
+    for (const p of CA) { const d = p[0] * ax + p[1] * ay; mnA = Math.min(mnA, d); mxA = Math.max(mxA, d); }
+    for (const p of CB) { const d = p[0] * ax + p[1] * ay; mnB = Math.min(mnB, d); mxB = Math.max(mxB, d); }
+    const ov = Math.min(mxA, mxB) - Math.max(mnA, mnB);
+    if (ov <= 0) return null;
+    if (ov < depth) { depth = ov; nx = ax; ny = ay; }
+  }
+  if ((B.x - A.x) * nx + (B.y - A.y) * ny < 0) { nx = -nx; ny = -ny; }
+  // contact point: B's corners poking into A and A's corners poking into B, averaged
+  let px = 0, py = 0, k = 0;
+  for (const p of CB) if (inside(A, p)) { px += p[0]; py += p[1]; k++; }
+  for (const p of CA) if (inside(B, p)) { px += p[0]; py += p[1]; k++; }
+  if (!k) { px = (A.x + B.x) / 2; py = (A.y + B.y) / 2; } else { px /= k; py /= k; }
+  return { nx, ny, depth, px, py };
+}
+
+// impulse between A and B at contact c (normal A->B). either may be static (im = iI = 0). e = bounce, mu = metal-on-metal
+function resolve(A, B, c, e = 0.2, mu = 0.4, correct = true) {
+  const rax = c.px - A.x, ray = c.py - A.y, rbx = c.px - B.x, rby = c.py - B.y;
+  const vax = A.vx - A.w * ray, vay = A.vy + A.w * rax, vbx = B.vx - B.w * rby, vby = B.vy + B.w * rbx;
+  const rvx = vbx - vax, rvy = vby - vay, vn = rvx * c.nx + rvy * c.ny;
+  if (vn < 0) {
+    const ran = rax * c.ny - ray * c.nx, rbn = rbx * c.ny - rby * c.nx;
+    const j = -(1 + (vn < -1 ? e : 0)) * vn / (A.im + B.im + ran * ran * A.iI + rbn * rbn * B.iI);
+    apply(A, -j * c.nx, -j * c.ny, rax, ray); apply(B, j * c.nx, j * c.ny, rbx, rby);
+    // friction along the contact
+    let tx = rvx - vn * c.nx, ty = rvy - vn * c.ny; const tl = Math.hypot(tx, ty);
+    if (tl > 1e-4) {
+      tx /= tl; ty /= tl;
+      const rat = rax * ty - ray * tx, rbt = rbx * ty - rby * tx;
+      const jt = Math.max(-mu * j, Math.min(mu * j, -tl / (A.im + B.im + rat * rat * A.iI + rbt * rbt * B.iI)));
+      apply(A, -jt * tx, -jt * ty, rax, ray); apply(B, jt * tx, jt * ty, rbx, rby);
+    }
+  }
+  if (correct && A.im + B.im > 0) { // push apart out of the overlap, by inverse mass (heavy one barely moves)
+    const k = Math.max(c.depth - 0.01, 0) * 0.8 / (A.im + B.im);
+    A.x -= c.nx * k * A.im; A.y -= c.ny * k * A.im; B.x += c.nx * k * B.im; B.y += c.ny * k * B.im;
+  }
+  return vn;
+}
+function apply(b, jx, jy, rx, ry) {
+  if (!b.im) return;
+  b.vx += jx * b.im; b.vy += jy * b.im; b.w += (rx * jy - ry * jx) * b.iI;
+}
+
+// tyres: coulomb friction along and across the body, and against spinning. a knocked-over bike slides on its side
+function tyres(b, dt, offroad) {
+  const [fx, fy, rx, ry] = axes(b), k = offroad ? 1.3 : 1;
+  const muL = (b.down ? 0.55 : b.muL) * k, muS = (b.down ? 0.55 : b.muS) * k;
+  let u = b.vx * fx + b.vy * fy, s = b.vx * rx + b.vy * ry;
+  const du = muL * G * dt, ds = muS * G * dt;
+  u = Math.abs(u) <= du ? 0 : u - Math.sign(u) * du;
+  s = Math.abs(s) <= ds ? 0 : s - Math.sign(s) * ds;
+  b.vx = fx * u + rx * s; b.vy = fy * u + ry * s;
+  // spinning drags all four tyres sideways: torque ~ mu m g * (half length / 2)
+  const dw = muS * G * (b.hl / 2) * b.m * b.iI * dt;
+  b.w = Math.abs(b.w) <= dw ? 0 : b.w - Math.sign(b.w) * dw;
+}
+
+// walls: half-planes at lateral wr (+ side) and wl (- side). corners past them get pushed back with a static-body impulse
+const WALL = { im: 0, iI: 0, vx: 0, vy: 0, w: 0, x: 0, y: 0 };
+function walls(b, wl, wr) {
+  for (const [lim, sgn] of [[wr, 1], [wl, -1]]) {
+    if (!lim) continue;
+    let worst = 0, px = 0, py = 0;
+    for (const p of corners(b)) { const d = (p[1] - lim) * sgn; if (d > worst) { worst = d; px = p[0]; py = p[1]; } }
+    if (worst > 0) { WALL.x = px; WALL.y = py + sgn * 1; resolve(WALL, b, { nx: 0, ny: -sgn, depth: worst, px, py }, 0.15, 0.5); }
+  }
+}
+
+// advance a set of bodies. each body: { ...body, wl, wr, offroad(y) }. pairs found by sorting along x
+function step(bodies, dt, minSub = 3, edge = 6) {
+  // substeps so nothing moves more than ~15cm per step (no tunnelling through a thin bike), capped for cost
+  let vmax = 0;
+  for (const b of bodies) vmax = Math.max(vmax, Math.hypot(b.vx, b.vy) + Math.abs(b.w) * b.hl);
+  const sub = Math.min(30, Math.max(minSub, Math.ceil(vmax * dt / 0.15))), h = dt / sub;
+  // kinematic bodies (driven by someone else's simulation): move at their velocity, push others, never get pushed
+  const kin = bodies.filter(b => b.kin);
+  for (const b of kin) { b._im = b.im; b._iI = b.iI; b.im = b.iI = 0; }
+  for (let k = 0; k < sub; k++) {
+    for (const b of bodies) {
+      if (!b.kin) tyres(b, h, Math.abs(b.y) > edge - 2);
+      b.x += b.vx * h; b.y += b.vy * h; b.a += b.w * h;
+    }
+    bodies.sort((p, q) => p.x - q.x);
+    for (let i = 0; i < bodies.length; i++)
+      for (let j = i + 1; j < bodies.length && bodies[j].x - bodies[i].x < 14; j++) {
+        const c = contact(bodies[i], bodies[j]);
+        if (c) { const vn = resolve(bodies[i], bodies[j], c); if (bodies[i].onHit) bodies[i].onHit(bodies[j], -vn); if (bodies[j].onHit) bodies[j].onHit(bodies[i], -vn); }
+      }
+    for (const b of bodies) if (!b.kin) walls(b, b.wl || -edge, b.wr || edge);
+  }
+  for (const b of kin) { b.im = b._im; b.iI = b._iI; }
+}
+
+    return { body, contact, resolve, step, mass, SPEC };
+  })();
+  // </physics>
+  const DIM = { coupe: { c: 0, len: 4.3, wid: 1.8 }, coach: { c: 1, len: 10.5, wid: 2.5 }, bike: { c: 2, len: 2.1, wid: 0.8 } };
+  const laneAngN = N => N.dir > 0 ? 0 : Math.PI;
+  const wrapA = a => a - Math.round(a / (2 * Math.PI)) * 2 * Math.PI;
+  // an NPC as a rigid body, from how it looks on our screen right now
+  const npcBody = N => PHYS.body(N.rs, N.rlat, laneAngN(N) + N.ryaw, N.vs, N.wreck ? N.vl : Math.abs(N.vs) * Math.sin(N.hd || 0), 0, DIM[N.type] || DIM.coupe);
   const PICK = [['coupe', 'Coupe'], ['coach', 'Coach'], ['bike', 'Bike']]; // index = game's setVehicle index
   const DELAY = 100, EXTRAP = 250, CULL2 = 1500 ** 2, TAG_DIST = 800, REC = 29;
   const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
@@ -392,6 +533,39 @@
     const now = performance.now();
     if (!g.contact) { g.contact = true; g.spun = 0; g.used = 0; g.cv = Math.max(0, -vr); g.hitV = g.cv; g.first = true; onImpact(g, g.cv, (cAx + cBx) / 2, P1.y, (cAz + cBz) / 2); }
 
+    // ---- NPCs: real rigid-body hit, simulated HERE (we own the car we hit, so no network lag) ----
+    if (g.isNpc && roadPoint(g.rs, g.rlat)) {
+      const fx = RP.fx, fz = RP.fz, lx = RP.nx, lz = RP.nz, R = (x, z) => [x * fx + z * fz, x * lx + z * lz];
+      const ox = P2.x + P2.ax * P2.M.cx + P2.bx * P2.M.cz, oz = P2.z + P2.az * P2.M.cx + P2.bz * P2.M.cz;
+      const [cs, cl] = R((cAx + cBx) / 2 - ox, (cAz + cBz) / 2 - oz), [ns, nl] = R(-nx, -nz), [pvs, pvl] = R(v.x, v.z);
+      const owned = g.local, B = owned || npcBody(g), T = owned ? B : { ...B };
+      const PB = { x: B.x + cs - ns, y: B.y + cl - nl, vx: pvs, vy: pvl, w: 0, im: 1 / mMe, iI: 0 };
+      const vx0 = T.vx, vy0 = T.vy, w0 = T.w;
+      PHYS.resolve(PB, T, { nx: ns, ny: nl, depth: 0, px: B.x + cs, py: B.y + cl }, 0.2, 0.4, false);
+      let mine = owned;
+      if (!owned) {
+        // does it beat their tyres? same rule the server uses. a nudge stays the server's business (old path below)
+        const dvx = T.vx - vx0, side = Math.max(0, Math.abs(T.vy - vy0) - 0.8), bk = g.type === 'bike';
+        if (g.wreck || Math.hypot(dvx, side) > (bk ? 3 : 4) || Math.abs(T.w - w0) > 0.6 || side > (bk ? 2 : 1.5)) {
+          g.local = mine = T; g.ownStart = now; g.restT = 0; T.wl = g.wl || 0; T.wr = g.wr || 0; if (bk) T.down = true;
+          if (ws?.readyState === 1) ws.send(JSON.stringify({ t: 'claim', id: g.id, st: [T.x, T.y, T.vx, T.vy, T.a, T.w].map(x => +x.toFixed(3)), wl: g.wl, wr: g.wr }));
+        }
+      }
+      if (mine) {
+        g.lastTouch = now; g.wreck = true;
+        // our side of the same impulse
+        let dvs = PB.vx - pvs, dvl = PB.vy - pvl, dx = fx * dvs + lx * dvl, dz = fz * dvs + lz * dvl;
+        if (bike) { const fl = Math.hypot(P1.ax, P1.az) || 1, ax = P1.ax / fl, az = P1.az / fl, lo = dx * ax + dz * az, la = (dx * -az + dz * ax) * 0.5; dx = ax * lo - az * la; dz = az * lo + ax * la; }
+        addVel(dx, dz);
+        // overlap split by mass: the heavy one barely moves
+        const myShare = mThem / (mMe + mThem), d = Math.min(depth, 0.5);
+        nudge(nx * (d * myShare + 0.005), nz * (d * myShare + 0.005));
+        mine.x += ns * d * (1 - myShare); mine.y += nl * d * (1 - myShare);
+        g.first = false;
+        return;
+      }
+    }
+
     // 1. solid: step out of the overlap (deep overlaps from spawns/teleports resolve over a few frames, not one jump).
     // NPCs only move when the server says so, so we always take the whole positional fix ourselves
     const push = Math.min(depth * (g.isNpc ? 1 : 0.5) + 0.005, 0.5);
@@ -539,6 +713,7 @@
       let N = npcs.get(id);
       if (!N) npcs.set(id, N = { id, isNpc: true, type: CARS[fl & 3] || 'coupe', color: (fl >> 2) & 7, rs: s, rlat: lat, rvl: 0, ryaw: yaw, pose: {}, vel: [0, 0, 0] });
       N.seen = now; N.dir = fl & 128 ? -1 : 1;
+      if (N.local) continue; // we're simulating this one: the server is just relaying us
       if (N.pending > 0 && now < N.hold) continue; // we shoved it and the server hasn't confirmed yet: keep our prediction
       N.s = s; N.vs = vs; N.lat = lat; N.vl = vl; N.t = st; N.tyaw = yaw; N.wreck = !!(fl & 64);
     }
@@ -595,30 +770,46 @@
     if (!npcs.size || !refreshRoad(now)) return;
     if (!NM.m) { NM.m = car.matrix.clone(); NM.t = car.matrix.clone(); NM.x = car.position.clone(); NM.y = car.position.clone(); NM.z = car.position.clone(); }
     const counts = {}, srvNow = now - off;
+    // our own simulated NPCs: step the engine. other NPCs close by are solid (unpushable) so ours can't go through them
+    const own = [...npcs.values()].filter(N => N.local);
+    if (own.length && dt > 0) {
+      const list = own.map(N => N.local);
+      for (const O of npcs.values())
+        if (!O.local && own.some(N => Math.abs(N.rs - O.rs) < 16 && Math.abs(N.rlat - O.rlat) < 8)) list.push(Object.assign(npcBody(O), { kin: true }));
+      PHYS.step(list, Math.min(dt, 0.05), 2, 6);
+    }
     for (const N of npcs.values()) {
       if (now - N.seen > 1500) { npcs.delete(N.id); continue; }
-      // predict from the last packet (server sim is smooth: speed along the road + a steering-limited sideways speed)
-      const age = Math.max(0, Math.min(1, (srvNow - N.t) / 1000));
-      // wrecks are braking/scrubbing on the server (~5.5 m/s2), predict that too so a shoved car doesn't overshoot
-      const sg = Math.sign(N.vs), dec = N.wreck ? 5.5 : 0, ta = dec ? Math.min(age, Math.abs(N.vs) / dec) : age;
-      const ps = N.s + N.vs * ta - sg * 0.5 * dec * ta * ta, pl = N.lat + N.vl * Math.min(age, 0.5);
-      const vNow = dec ? N.vs - sg * dec * ta : N.vs;
-      N.rs += vNow * dt;
-      N.rs = Math.abs(ps - N.rs) > 30 ? ps : N.rs + (ps - N.rs) * Math.min(1, dt * 4);
-      const err = pl - N.rlat, spd = Math.abs(vNow), Mb = models[N.type] || models.coupe, L = Mb ? Mb.hx * 1.25 : 2.6;
-      if (N.wreck || Math.abs(err) > 2.5 || spd < 0.8) {
-        // sliding wreck / big correction / crawling: move sideways directly (a skidding car really does go sideways)
-        N.rlat += N.vl * dt * (age < 0.5 ? 1 : 0) + err * Math.min(1, dt * 5);
-        N.hd = (N.hd || 0) * Math.pow(0.1, dt);
+      let vNow, spd;
+      const Mb = models[N.type] || models.coupe, L = Mb ? Mb.hx * 1.25 : 2.6;
+      if (N.local) { // ours: exactly where our engine has it
+        const b = N.local;
+        N.rs = b.x; N.rlat = b.y; N.vs = vNow = b.vx; N.vl = N.rvl = b.vy; spd = Math.abs(vNow); N.hd = 0;
+        N.ryaw = N.tyaw = wrapA(b.a - laneAngN(N)); N.wreck = true;
       } else {
-        // driving: aim the nose where it needs to go (server's sideways speed + closing the gap), turn no faster than
-        // the front wheels allow at this speed (max ~35 deg lock), and move only where the nose points. no crabbing
-        const want = Math.max(-0.6, Math.min(0.6, Math.atan2(N.vl + Math.max(-2, Math.min(2, err * 1.5)), spd)));
-        const rate = spd / L * 0.7 * dt;
-        N.hd = (N.hd || 0) + Math.max(-rate, Math.min(rate, (want - (N.hd || 0)) * Math.min(1, dt * 8)));
-        N.rlat += spd * Math.sin(N.hd) * dt;
+        // predict from the last packet (server sim is smooth: speed along the road + a steering-limited sideways speed)
+        const age = Math.max(0, Math.min(1, (srvNow - N.t) / 1000));
+        // wrecks are braking/scrubbing on the server (~5.5 m/s2), predict that too so a shoved car doesn't overshoot
+        const sg = Math.sign(N.vs), dec = N.wreck ? 5.5 : 0, ta = dec ? Math.min(age, Math.abs(N.vs) / dec) : age;
+        const ps = N.s + N.vs * ta - sg * 0.5 * dec * ta * ta, pl = N.lat + N.vl * Math.min(age, 0.5);
+        vNow = dec ? N.vs - sg * dec * ta : N.vs;
+        N.rs += vNow * dt;
+        N.rs = Math.abs(ps - N.rs) > 30 ? ps : N.rs + (ps - N.rs) * Math.min(1, dt * 4);
+        const err = pl - N.rlat; spd = Math.abs(vNow);
+        if (N.wreck || Math.abs(err) > 2.5 || spd < 0.8) {
+          // sliding wreck / big correction / crawling: move sideways directly (a skidding car really does go sideways)
+          N.rlat += N.vl * dt * (age < 0.5 ? 1 : 0) + err * Math.min(1, dt * 5);
+          N.hd = (N.hd || 0) * Math.pow(0.1, dt);
+        } else {
+          // driving: aim the nose where it needs to go (server's sideways speed + closing the gap), turn no faster than
+          // the front wheels allow at this speed (max ~35 deg lock), and move only where the nose points. no crabbing
+          const want = Math.max(-0.6, Math.min(0.6, Math.atan2(N.vl + Math.max(-2, Math.min(2, err * 1.5)), spd)));
+          const rate = spd / L * 0.7 * dt;
+          N.hd = (N.hd || 0) + Math.max(-rate, Math.min(rate, (want - (N.hd || 0)) * Math.min(1, dt * 8)));
+          N.rlat += spd * Math.sin(N.hd) * dt;
+        }
+        { let da = N.tyaw - N.ryaw; da -= Math.round(da / (2 * Math.PI)) * 2 * Math.PI; N.ryaw += da * Math.min(1, dt * (N.wreck ? 7 : 2)); }
       }
-      { let da = N.tyaw - N.ryaw; da -= Math.round(da / (2 * Math.PI)) * 2 * Math.PI; N.ryaw += da * Math.min(1, dt * (N.wreck ? 7 : 2)); }
       N.tilt = (N.tilt || 0) + ((N.wreck && N.type === 'bike' ? 1.4 : 0) - (N.tilt || 0)) * Math.min(1, dt * 5); // bikes go down
       // walls: where the game has barriers on this stretch, NPCs (skidding wrecks, swerves) stop at them instead of passing
       // through. it's the game's own road data and identical for everyone, so every client stops them in the same place
@@ -631,7 +822,8 @@
         if (nb.lWallDist > 0) wl = Math.max(wl, -nb.lWallDist); if (nb.dswl < -3) wl = Math.max(wl, nb.dswl);
       }
       N.wr = wr < 30 ? +wr.toFixed(1) : 0; N.wl = wl > -30 ? +wl.toFixed(1) : 0;
-      if (Mw) {
+      if (N.local) { N.local.wl = N.wl; N.local.wr = N.wr; }
+      else if (Mw) {
         const ys = Math.abs(Math.sin(N.ryaw)), hw = ys * Mw.hx + (1 - ys) * Mw.hz + 0.1; // wider when spun sideways
         if (N.rlat > wr - hw) { N.rlat = wr - hw; if (N.vl > 0) N.vl = N.rvl = 0; }
         if (N.rlat < wl + hw) { N.rlat = wl + hw; if (N.vl < 0) N.vl = N.rvl = 0; }
@@ -884,6 +1076,21 @@
     }
   };
 
+  // ================= owned NPCs: stream + release =================
+  setInterval(() => {
+    if (!joined || ws?.readyState !== 1) return;
+    const now = performance.now(), me = refreshRoad(now) ? myRoad() : null, b = [];
+    for (const N of npcs.values()) {
+      const B = N.local; if (!B) continue;
+      N.restT = Math.hypot(B.vx, B.vy) < 0.3 && Math.abs(B.w) < 0.1 ? (N.restT || 0) + 0.1 : 0;
+      const rel = (N.restT > 1.5 && now - (N.lastTouch || 0) > 1500) || (me && Math.abs(me.s - B.x) > 80) || now - N.ownStart > 30000;
+      b.push([N.id, +B.x.toFixed(2), +B.y.toFixed(2), +B.vx.toFixed(2), +B.vy.toFixed(2), +B.a.toFixed(3), +B.w.toFixed(2), rel ? 1 : 0]);
+      if (rel) { N.local = null; N.s = B.x; N.lat = B.y; N.vs = B.vx; N.vl = B.vy; N.t = now - off; N.tyaw = N.ryaw; N.pending = 0; }
+      if (b.length >= 6) break;
+    }
+    if (b.length) ws.send(JSON.stringify({ t: 'own', b }));
+  }, 100);
+
   // ================= network =================
   const out = new DataView(new ArrayBuffer(34));
   const i16 = x => Math.max(-32767, Math.min(32767, Math.round(x)));
@@ -917,7 +1124,11 @@
       if (e.data.byteLength < 7) return;
       const dv = new DataView(e.data), op = dv.getUint8(0);
       if (op === 2) onTick(dv); else if (op === 8) onTraffic(dv); else if (op === 7) onMapFeed(dv);
-      else if (op === 9) { const N = npcs.get(dv.getUint16(1, true)); if (N && N.pending > 0) N.pending--; } // hit applied: updates from here on include it
+      else if (op === 9) { // [id, kind]: 0 hit applied, 1 we own it, 2 denied, 3 revoked
+        const N = npcs.get(dv.getUint16(1, true)), k = dv.byteLength > 3 ? dv.getUint8(3) : 0;
+        if (N && k === 0 && N.pending > 0) N.pending--;
+        if (N && k >= 2 && N.local) { const B = N.local; N.local = null; N.s = B.x; N.lat = B.y; N.vs = B.vx; N.vl = B.vy; N.t = performance.now() - off; } // someone else has it / we sent nonsense: back to the server's view (eases over from here)
+      }
     };
     ws.onclose = e => {
       clearGhosts();

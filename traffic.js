@@ -233,8 +233,9 @@ module.exports = function traffic({ online, clock, send }) {
     }
 
     // physics: every wreck is a rigid body. step them (collisions between wrecks, walls, tyre grip), then copy back
-    const bodies = [];
+    const bodies = [], now = clock();
     for (const n of npcs.values()) if (n.b) {
+      if (n.owner && (now - n.ownT > OWN_TIMEOUT || !players.some(p => p.id === n.owner))) { n.owner = null; n.b.kin = false; }
       const W = n.walls, b = n.b;
       b.wl = W && Math.abs(n.s - W.s) < 40 ? W.wl : 0; b.wr = W && Math.abs(n.s - W.s) < 40 ? W.wr : 0;
       bodies.push(b);
@@ -244,7 +245,7 @@ module.exports = function traffic({ online, clock, send }) {
       for (const n of npcs.values()) if (n.b) {
         const b = n.b, still = Math.hypot(b.vx, b.vy) < 0.3 && Math.abs(b.w) < 0.1;
         n.s = b.x; n.lat = b.y; n.vl = b.vy; n.yaw = wrap(b.a - laneAng(n)) * 180 / Math.PI;
-        n.crashT -= dt; n.wreckT = (n.wreckT || 0) + dt;
+        n.crashT -= n.owner ? 0 : dt; n.wreckT = (n.wreckT || 0) + dt;
         if (n.crashT <= 0 && still) { // limps off, untangling from the wreck
           n.b = null; n.crashT = 0; n.over = false; n.blocker = null; n.ghostT = 4; n.v = 0;
           if (Math.abs(n.yaw) > 100) n.yaw = 0; // facing backwards: (off camera, it's long past) just point it the right way
@@ -292,8 +293,54 @@ module.exports = function traffic({ online, clock, send }) {
   const PB = { im: 0, iI: 0, w: 0 };
   function hit(p, m) {
     // always confirm (op 9) so the client stops holding its prediction: anything we broadcast after this includes the hit
-    const ack = Buffer.from([9, 0, 0]); ack.writeUInt16LE(m.id & 0xffff, 1);
-    try { applyHit(p, m); } finally { send(p, ack); }
+    try { applyHit(p, m); } finally { reply(p, m.id, 0); }
+  }
+  // op 9: [9, id u16, kind] kind 0 = hit applied, 1 = you own it now, 2 = ownership denied, 3 = ownership revoked
+  const reply = (p, id, kind) => { const b = Buffer.from([9, 0, 0, kind]); b.writeUInt16LE(id & 0xffff, 1); send(p, b); };
+
+  // ---- ownership (distributed physics) ----
+  // the player who hits an NPC hard simulates it on their own machine with the same engine (no lag for them), and
+  // streams its state here 10x/s. the server checks every update is physically plausible, relays it to everyone, and
+  // treats it as an unpushable (kinematic) body so server-run wrecks still bounce off it. when it settles, or the owner
+  // goes quiet / leaves / sends nonsense, the server takes it back and carries on from the last good state.
+  const OWN_TIMEOUT = 1500;
+  const num = (v, a) => clamp(Number.isFinite(+v) ? +v : 0, -a, a);
+  function claim(p, m) {
+    const n = npcs.get(m.id | 0), now = clock();
+    const ok = n && p.road && cfg.crashes && Math.abs(n.s - p.road.s) < 30 && !(n.owner && n.owner !== p.id && now - n.ownT < OWN_TIMEOUT);
+    if (!ok) return reply(p, m.id, 2);
+    const st = m.st || [];
+    const s = +st[0], lat = num(st[1], 12), vs = num(st[2], 60), vl = num(st[3], 30), a = num(st[4], 20), w = num(st[5], 12);
+    // where they say it is must be close to where we have it (allowing for their lag), and the hit can't add more speed
+    // than the two of them were doing between them
+    const slack = 3 + Math.abs(vAlong(n)) * 0.6, vmax = Math.abs(vAlong(n)) + Math.abs(p.road.vs) * 1.3 + 4;
+    if (!Number.isFinite(s) || Math.abs(s - n.s) > slack || Math.abs(lat - n.lat) > 4 || Math.hypot(vs, vl) > vmax) return reply(p, m.id, 2);
+    const wr = +m.wr || 0, wl = +m.wl || 0;
+    n.walls = { s, wr: wr > 1 && wr < 30 ? wr : 0, wl: wl < -1 && wl > -30 ? wl : 0 };
+    const B = n.b || bodyOf(n);
+    Object.assign(B, { x: s, y: lat, vx: vs, vy: vl, a, w, kin: true });
+    if (n.T.c === 2) B.down = true;
+    if (!n.b) crash(n, 'player-hit', B); else n.crashT = Math.max(n.crashT, 6);
+    n.owner = p.id; n.ownT = now; n.ownLast = now;
+    reply(p, m.id, 1);
+  }
+  function own(p, m) {
+    const now = clock();
+    for (const u of Array.isArray(m.b) ? m.b.slice(0, 6) : []) {
+      const n = npcs.get(u[0] | 0);
+      if (!n || n.owner !== p.id || !n.b) { reply(p, u[0] | 0, 3); continue; }
+      const B = n.b, dt = Math.max(0.05, (now - n.ownLast) / 1000);
+      const s = +u[1], lat = num(u[2], 12), vs = num(u[3], 60), vl = num(u[4], 30), a = num(u[5], 20), w = num(u[6], 12);
+      // plausible? can't move further than its speed allows, can't speed up (nothing's pushing it but you, and you're
+      // only allowed so much), can't spin like a top
+      const sp0 = Math.hypot(B.vx, B.vy), sp = Math.hypot(vs, vl), moved = Math.hypot(s - B.x, lat - B.y);
+      if (!Number.isFinite(s) || moved > (Math.max(sp0, sp) + 4) * dt + 1.5 || sp > Math.max(sp0 + 6, Math.abs(p.road.vs) + 6) || Math.abs(w) > 10) {
+        n.owner = null; B.kin = false; reply(p, n.id, 3); continue;
+      }
+      Object.assign(B, { x: s, y: lat, vx: vs, vy: vl, a, w });
+      n.ownT = n.ownLast = now; n.crashT = Math.max(n.crashT, 2);
+      if (u[7]) { n.owner = null; B.kin = false; } // owner says it's settled: back to the server
+    }
   }
   function applyHit(p, m) {
     const n = npcs.get(m.id | 0), now = clock();
@@ -336,7 +383,7 @@ module.exports = function traffic({ online, clock, send }) {
   if (!process.env.TRAFFIC_TEST) setInterval(() => { if (cfg.on) broadcast(roadPlayers()); }, 1000 / SEND_HZ);
 
   return {
-    hit,
+    hit, claim, own,
     command(a, b) {
       if (a === 'on' || a === 'off') { cfg.on = a === 'on'; if (!cfg.on) { npcs.clear(); broadcast(roadPlayers()); } return 'traffic ' + a; }
       if (a === 'density' && +b >= 0 && +b <= 20) { cfg.density = +b; return 'density ' + b + ' cars/km/lane'; }

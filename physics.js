@@ -110,9 +110,12 @@ function step(bodies, dt, minSub = 3, edge = 6) {
   let vmax = 0;
   for (const b of bodies) vmax = Math.max(vmax, Math.hypot(b.vx, b.vy) + Math.abs(b.w) * b.hl);
   const sub = Math.min(30, Math.max(minSub, Math.ceil(vmax * dt / 0.15))), h = dt / sub;
+  // kinematic bodies (driven by someone else's simulation): move at their velocity, push others, never get pushed
+  const kin = bodies.filter(b => b.kin);
+  for (const b of kin) { b._im = b.im; b._iI = b.iI; b.im = b.iI = 0; }
   for (let k = 0; k < sub; k++) {
     for (const b of bodies) {
-      tyres(b, h, Math.abs(b.y) > edge - 2);
+      if (!b.kin) tyres(b, h, Math.abs(b.y) > edge - 2);
       b.x += b.vx * h; b.y += b.vy * h; b.a += b.w * h;
     }
     bodies.sort((p, q) => p.x - q.x);
@@ -121,8 +124,9 @@ function step(bodies, dt, minSub = 3, edge = 6) {
         const c = contact(bodies[i], bodies[j]);
         if (c) { const vn = resolve(bodies[i], bodies[j], c); if (bodies[i].onHit) bodies[i].onHit(bodies[j], -vn); if (bodies[j].onHit) bodies[j].onHit(bodies[i], -vn); }
       }
-    for (const b of bodies) walls(b, b.wl || -edge, b.wr || edge);
+    for (const b of bodies) if (!b.kin) walls(b, b.wl || -edge, b.wr || edge);
   }
+  for (const b of kin) { b.im = b._im; b.iI = b._iI; }
 }
 
 module.exports = { body, contact, resolve, step, mass, SPEC };

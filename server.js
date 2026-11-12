@@ -108,7 +108,7 @@ const server = http.createServer((req, res) => {
   }
   res.writeHead(200, { 'content-type': 'text/plain' }).end(`slowroads mp · ${online().length} online · ${traffic.count} npcs\n`);
 });
-const wss = new WebSocketServer({ server, maxPayload: 256, perMessageDeflate: false });
+const wss = new WebSocketServer({ server, maxPayload: 512, perMessageDeflate: false });
 server.listen(PORT, '0.0.0.0');
 
 wss.on('connection', (ws, req) => {
@@ -124,13 +124,15 @@ wss.on('connection', (ws, req) => {
   ws.on('pong', () => p.alive = true);
 
   ws.on('message', (data, bin) => {
-    if (++p.msgs > 60) return kick(p, 'spam');
-    if (p.msgs > 30) return;
+    if (++p.msgs > 100) return kick(p, 'spam');
+    if (p.msgs > 50) return; // 15/s state + 10/s owned-NPC updates + hit reports
     if (!p.name) return bin ? ws.close(4004, 'bad hello') : hello(p, data);
     if (bin && (data.length === 28 || data.length === 34) && data[0] === 1) return state(p, data);
-    if (!bin && data.length < 200) { // small json events after join: hit reports for traffic crashes
+    if (!bin && data.length < 480) { // small json events after join: hit reports for traffic crashes
       let m; try { m = JSON.parse(data); } catch { return; }
       if (m.t === 'hit') traffic.hit(p, m);
+      else if (m.t === 'claim') traffic.claim(p, m);
+      else if (m.t === 'own') traffic.own(p, m);
     }
   });
 

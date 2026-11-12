@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 14;
+  const MOD_VERSION = 15;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -317,7 +317,10 @@
   // tyre grip) and that's what everyone sees a moment later
   const sendPush = (N, first, now, c) => {
     const dvx = N.pdx || 0, dvz = N.pdz || 0, sp = N.pspin || 0;
-    N.pdx = N.pdz = N.pspin = 0; N.lastPush = now; N.hold = now + 250;
+    N.pdx = N.pdz = N.pspin = 0; N.lastPush = now;
+    // keep our prediction until the server confirms it has applied this hit (op 9). a fixed timer isn't enough: the
+    // round trip to the server can be 300ms+, and a stale update from before the hit would snap the car back
+    N.pending = (N.pending || 0) + 1; N.hold = now + 2500;
     if (!roadPoint(N.rs, N.rlat)) return;
     const R = (x, z) => [x * RP.fx + z * RP.fz, x * RP.nx + z * RP.nz]; // world xz -> road (along s, lateral)
     const [dvs, dvl] = R(dvx, dvz);
@@ -536,7 +539,7 @@
       let N = npcs.get(id);
       if (!N) npcs.set(id, N = { id, isNpc: true, type: CARS[fl & 3] || 'coupe', color: (fl >> 2) & 7, rs: s, rlat: lat, rvl: 0, ryaw: yaw, pose: {}, vel: [0, 0, 0] });
       N.seen = now; N.dir = fl & 128 ? -1 : 1;
-      if (now < (N.hold || 0)) continue; // we just shoved it: keep our prediction until the server has caught up
+      if (N.pending > 0 && now < N.hold) continue; // we shoved it and the server hasn't confirmed yet: keep our prediction
       N.s = s; N.vs = vs; N.lat = lat; N.vl = vl; N.t = st; N.tyaw = yaw; N.wreck = !!(fl & 64);
     }
   };
@@ -914,6 +917,7 @@
       if (e.data.byteLength < 7) return;
       const dv = new DataView(e.data), op = dv.getUint8(0);
       if (op === 2) onTick(dv); else if (op === 8) onTraffic(dv); else if (op === 7) onMapFeed(dv);
+      else if (op === 9) { const N = npcs.get(dv.getUint16(1, true)); if (N && N.pending > 0) N.pending--; } // hit applied: updates from here on include it
     };
     ws.onclose = e => {
       clearGhosts();

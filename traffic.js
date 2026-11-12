@@ -291,6 +291,11 @@ module.exports = function traffic({ online, clock, send }) {
   // everything is capped/sanity-checked so a modified client can't launch NPCs
   const PB = { im: 0, iI: 0, w: 0 };
   function hit(p, m) {
+    // always confirm (op 9) so the client stops holding its prediction: anything we broadcast after this includes the hit
+    const ack = Buffer.from([9, 0, 0]); ack.writeUInt16LE(m.id & 0xffff, 1);
+    try { applyHit(p, m); } finally { send(p, ack); }
+  }
+  function applyHit(p, m) {
     const n = npcs.get(m.id | 0), now = clock();
     if (!n || !p.road || now - (p.lastHit || 0) < 100) return;
     if (Math.abs(n.s - p.road.s) > 25) return; // must actually be next to it

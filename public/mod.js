@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 13;
+  const MOD_VERSION = 14;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -311,20 +311,21 @@
     C.collisionPos?.set?.(x, y + 0.5, z);
   };
   // rough masses (a coupe = 1): a coach shrugs you off, a bike gets launched
-  const MASS = { coupe: 1, coach: 4, bike: 0.4 };
-  // the push we gave an NPC (world-space change in its velocity + spin) goes to the server in road terms, and we
-  // predict it locally right away so it moves the same frame instead of after the round trip
-  const sendPush = (N, first, now) => {
+  const MASS = { coupe: 1300, coach: 12000, bike: 330 }; // kg, bike includes the rider. same numbers as the server's engine
+  // contact with an NPC: we show the shove straight away (prediction), and send the server the contact itself (where on
+  // the NPC, which way, how fast we were going). the server's rigid-body engine works out the real result (mass, spin,
+  // tyre grip) and that's what everyone sees a moment later
+  const sendPush = (N, first, now, c) => {
     const dvx = N.pdx || 0, dvz = N.pdz || 0, sp = N.pspin || 0;
-    N.pdx = N.pdz = N.pspin = 0; N.lastPush = now; N.hold = now + 300;
+    N.pdx = N.pdz = N.pspin = 0; N.lastPush = now; N.hold = now + 250;
     if (!roadPoint(N.rs, N.rlat)) return;
-    const dvs = dvx * RP.fx + dvz * RP.fz, dvl = dvx * RP.nx + dvz * RP.nz;
-    const v = first ? N.hitV : Math.hypot(dvx, dvz);
-    // local prediction: rebase on where it is now, then add the shove
+    const R = (x, z) => [x * RP.fx + z * RP.fz, x * RP.nx + z * RP.nz]; // world xz -> road (along s, lateral)
+    const [dvs, dvl] = R(dvx, dvz);
     const srvNow = performance.now() - off;
-    N.s = N.rs; N.lat = N.rlat; N.t = srvNow; N.vs += dvs; N.vl = Math.max(-12, Math.min(12, N.vl + dvl));
-    if (first && v > 6) { N.wreck = true; N.tyaw = N.ryaw + sp * Math.PI / 180; }
-    if (ws?.readyState === 1) ws.send(JSON.stringify({ t: 'hit', id: N.id, v: +v.toFixed(1), dvs: +dvs.toFixed(2), dvl: +dvl.toFixed(2), spin: Math.round(sp), wl: N.wl, wr: N.wr }));
+    N.s = N.rs; N.lat = N.rlat; N.t = srvNow; N.vs += dvs; N.vl = Math.max(-15, Math.min(15, N.vl + dvl));
+    if (first && Math.hypot(dvs, dvl) > (N.type === 'bike' ? 2.5 : 4)) { N.wreck = true; N.tyaw = N.ryaw + sp * Math.PI / 180; }
+    const [cs, cl] = R(c.px - c.ox, c.pz - c.oz), [ns, nl] = R(c.nx, c.nz), [pvs, pvl] = R(c.vx, c.vz), f = v => +v.toFixed(2);
+    if (ws?.readyState === 1) ws.send(JSON.stringify({ t: 'hit', id: N.id, cs: f(cs), cl: f(cl), ns: f(ns), nl: f(nl), pvs: f(pvs), pvl: f(pvl), wl: N.wl, wr: N.wr }));
   };
 
   // our car's physics state, for both kinds of vehicle in slowroads:
@@ -399,7 +400,8 @@
     if (g.isNpc && vr < 0) {
       // their tyres grip the road: a parked/wrecked car is braked (~0.7g), a driving one rolls (~0.15g). the ground soaks up
       // that much per frame, so slow pushes barely move them and you have to really shove. on impact it's negligible
-      const u = -vr * (g.first ? 1.2 : 1), fdt = (g.wreck || Math.abs(g.vs) < 1 ? 7 : 1.5) * (C.pdT || 1 / 60);
+      const al = Math.abs(nx * P2.ax + nz * P2.az) / (Math.hypot(P2.ax, P2.az) || 1); // 1 = pushing along the car, 0 = sideways
+      const u = -vr * (g.first ? 1.2 : 1), fdt = (g.wreck ? 7 : Math.abs(g.vs) < 1 ? 7 : 1.5 * al * al + 8 * (1 - al * al)) * (C.pdT || 1 / 60);
       j = (u + fdt) * share; jN = j * mMe / mThem - fdt;
       if (jN < 0) { jN = 0; j = -vr; } // didn't budge: it's a wall this frame
     }
@@ -416,7 +418,11 @@
       const Ib = (P2.M.hx * P2.M.hx + P2.M.hz * P2.M.hz) / 3;
       const px = -nx * jN + tfx, pz = -nz * jN + tfz;
       g.pspin = Math.max(-80, Math.min(80, (g.pspin || 0) + (oz * px - ox * pz) / Ib * 57.3 * 0.6));
-      if (g.first || (now - (g.lastPush || 0) > 150 && Math.hypot(g.pdx, g.pdz) > 0.3)) { sendPush(g, g.first, now); g.first = false; }
+      if (g.first || (now - (g.lastPush || 0) > 150 && vr < -0.2)) {
+        // contact point, the push direction onto them (= -our normal), and our velocity before this frame's response
+        sendPush(g, g.first, now, { px: (cAx + cBx) / 2, pz: (cAz + cBz) / 2, ox: P2.x + P2.ax * P2.M.cx + P2.bx * P2.M.cz, oz: P2.z + P2.az * P2.M.cx + P2.bz * P2.M.cz, nx: -nx, nz: -nz, vx: v.x, vz: v.z });
+        g.first = false;
+      }
     }
     addVel(ix, iz);
     g.first = false;
@@ -609,7 +615,8 @@
         N.hd = (N.hd || 0) + Math.max(-rate, Math.min(rate, (want - (N.hd || 0)) * Math.min(1, dt * 8)));
         N.rlat += spd * Math.sin(N.hd) * dt;
       }
-      N.ryaw += (N.tyaw - N.ryaw) * Math.min(1, dt * (N.wreck ? 7 : 2)); // wrecks spin out fast, recover slowly
+      { let da = N.tyaw - N.ryaw; da -= Math.round(da / (2 * Math.PI)) * 2 * Math.PI; N.ryaw += da * Math.min(1, dt * (N.wreck ? 7 : 2)); }
+      N.tilt = (N.tilt || 0) + ((N.wreck && N.type === 'bike' ? 1.4 : 0) - (N.tilt || 0)) * Math.min(1, dt * 5); // bikes go down
       // walls: where the game has barriers on this stretch, NPCs (skidding wrecks, swerves) stop at them instead of passing
       // through. it's the game's own road data and identical for everyone, so every client stops them in the same place
       // stone walls (dswl/dswr, along fields) count too: they're signed lateral positions, guardrails are distances
@@ -646,7 +653,11 @@
       N.ang = ang; N.roll = (N.roll || 0) - (N.wreck ? 0 : vNow * N.dir) * dt / 0.5;
       const Y = NM.y.set(0, 1, 0).addScaledVector(X, -X.y).normalize();
       const Z = NM.z.crossVectors(X, Y);
-      NM.m.makeBasis(X, Y, Z).setPosition(RP.x, RP.y, RP.z);
+      // the server's s/lat is the vehicle's CENTRE (that's what its physics boxes use), models have their origin at the
+      // rear axle: shift so the middle of the car sits on the spot
+      const M0 = models[N.type] || models.coupe, ocx = M0 ? M0.cx : 0, ocz = M0 ? M0.cz : 0;
+      NM.m.makeBasis(X, Y, Z).setPosition(RP.x - X.x * ocx - Z.x * ocz, RP.y - X.y * ocx, RP.z - X.z * ocx - Z.z * ocz);
+      if (N.tilt > 0.01) NM.m.multiply((WR.r ||= NM.m.clone()).makeRotationX(N.tilt)); // lying on its side
       const type = models[N.type] ? N.type : 'coupe';
       const idx = counts[type] = (counts[type] || 0) + 1;
       const F = fleetFor(type, Math.max(idx, (fleets[type]?.cap || 0)));
@@ -668,7 +679,7 @@
       N.wx = RP.x; N.wz = RP.z; N.mapT = now; // for the minimap
       if (joined && d2 < 900) { // close enough to touch: real footprint pose for collisions
         const P = N.pose;
-        P.x = RP.x; P.y = RP.y; P.z = RP.z; P.ax = X.x; P.az = X.z; P.bx = Z.x; P.bz = Z.z; P.M = M;
+        P.x = RP.x - X.x * ocx - Z.x * ocz; P.y = RP.y; P.z = RP.z - X.z * ocx - Z.z * ocz; P.ax = X.x; P.az = X.z; P.bx = Z.x; P.bz = Z.z; P.M = M;
         N.near = true;
       }
     }

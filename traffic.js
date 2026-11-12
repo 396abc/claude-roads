@@ -5,6 +5,7 @@
 //   changes, overtakes and dodges are real curved paths, never jumps. NPCs swerve around players, overtake slow traffic,
 //   and when someone misjudges it they crash, skid, and the road jams up until it clears.
 
+const PHYS = require('./physics');
 const LANE = 1.6, ROAD_EDGE = 3.5, WIN = 2000, DESPAWN = 2600, MAX_NPC = 180, REC = 12, SIM_HZ = 10, SEND_HZ = 5;
 const AHEAD_MIN = 700, BEHIND_MIN = 140; // spawn out of sight: far up the road, or just behind (everyone looks forward)
 const TYPES = [ // c = car index (coupe/coach/bike), w = spawn weight, v = desired speed m/s, len/wid = size m, a = max accel
@@ -75,27 +76,28 @@ module.exports = function traffic({ online, clock, send }) {
     }
   }
 
-  // velocity along the road (signed, +s) right now: driving or sliding as a wreck
-  const vAlong = n => n.crashT > 0 ? n.skidS : n.v * n.lane;
-  // wreck it. skidS = the speed along the road it's left with after the hit (momentum), it slides on that and on its
-  // sideways speed, then friction stops it. spin from the hit if known, else a random spin that grows with severity
-  const crash = (n, sev, sideKick, why, skidS, spin) => {
-    if (process.env.TRAFFIC_TEST && !(n.crashT > 0)) (module.exports.log ||= []).push(why);
-    const fresh = !(n.crashT > 0);
-    n.crashT = Math.max(n.crashT, rand(14, 26));
-    n.dis = 0; n.squeeze = false; n.swerveT = 0;
-    n.skidS = clamp(skidS ?? vAlong(n) * 0.5, -40, 40);
-    n.vl = clamp(n.vl + sideKick, -12, 12);
-    if (spin != null) n.yawTarget = clamp((n.yawTarget || 0) + spin, -100, 100);
-    else if (fresh) n.yawTarget = (Math.random() < 0.5 ? 1 : -1) * rand(15, 25 + 55 * Math.min(1, sev / 20)); // harder hit, bigger spin
-    n.v = 0;
+  // velocity along the road (signed, +s) right now: driving, or the rigid body's if it's wrecked
+  const vAlong = n => n.b ? n.b.vx : n.v * n.lane;
+  const laneAng = n => n.lane > 0 ? 0 : Math.PI;
+  const wrap = a => a - Math.round(a / (2 * Math.PI)) * 2 * Math.PI;
+  // a rigid body matching where the NPC is and how it's moving (driving NPCs too: used for contact tests)
+  const bodyOf = n => n.b || PHYS.body(n.s, n.lat, laneAng(n) + n.yaw * Math.PI / 180, n.v * n.lane, n.vl, 0, n.T);
+  // wreck it: from now until it stops it's a physics body (mass, grip, spin, collisions, walls). bikes go down
+  const crash = (n, why, B) => {
+    if (n.b) { n.crashT = Math.max(n.crashT, 8); return n.b; }
+    if (process.env.TRAFFIC_TEST) (module.exports.log ||= []).push(why);
+    n.b = B || bodyOf(n);
+    n.b.w += rand(-0.25, 0.25); // nothing lines up perfectly
+    if (n.T.c === 2) n.b.down = true;
+    n.crashT = rand(14, 26); n.dis = 0; n.squeeze = false; n.swerveT = 0; n.v = 0;
+    return n.b;
   };
 
   function step(dt, players) {
     // occupancy per lane: a body overlapping both lanes (mid lane change, straddling the line) blocks both
     const occ = [];
     for (const n of npcs.values())
-      for (const l of lanesAt(n.lat, n.T.wid / 2)) occ.push({ ref: n, lane: l, s: n.s, vs: n.v * n.lane, len: n.T.len, wid: n.T.wid, crashed: n.crashT > 0, lat: n.lat });
+      for (const l of lanesAt(n.lat, n.T.wid / 2)) occ.push({ ref: n, lane: l, s: n.s, vs: vAlong(n), len: n.T.len, wid: n.T.wid, crashed: n.crashT > 0, lat: n.lat });
     for (const p of players)
       if (onRoad(p)) for (const l of lanesAt(p.road.lat, 0.9)) occ.push({ ref: p, player: true, lane: l, s: p.road.s, vs: p.road.vs, len: 4.4, wid: 1.8, lat: p.road.lat });
 
@@ -110,28 +112,7 @@ module.exports = function traffic({ online, clock, send }) {
 
     for (const n of npcs.values()) {
       if (n.ghostT > 0) n.ghostT -= dt;
-      if (n.crashT > 0) { // wrecked: slides on whatever momentum the hit left it (tyre friction ~0.6g), then sits there blocking
-        // friction depends on which way it's pointing vs where it's going: rolling straight on (rear-ended) it coasts,
-        // sliding sideways the tyres scrub hard. yaw = how far it's turned from the road
-        const sy = Math.abs(Math.sin(n.yaw * Math.PI / 180)), dirS = Math.sign(n.skidS || 0);
-        // rolling straight the driver's on the brakes (~0.4g), sideways the tyres scrub (~0.75g)
-        const frS = (4 + 3.5 * sy) * dt, fr = (4 + 3.5 * (1 - sy)) * dt;
-        n.skidS = Math.abs(n.skidS || 0) <= frS ? 0 : n.skidS - dirS * frS;
-        if (n.skidS && occ.some(o => o.ref !== n && Math.abs(o.lat - n.lat) < 2 && (o.s - n.s) * dirS > 0 && (o.s - n.s) * dirS < (o.len + n.T.len) / 2 + 0.5)) n.skidS = 0;
-        n.s += n.skidS * dt;
-        n.vl = Math.abs(n.vl) <= fr ? 0 : n.vl - Math.sign(n.vl) * fr;
-        n.lat = clamp(n.lat + n.vl * dt, -ROAD_EDGE - 1, ROAD_EDGE + 1);
-        // walls the hitting player's client saw there (the server has no road geometry): stop against them, don't pass
-        const W = n.walls, hw = n.T.wid / 2 + 0.2;
-        if (W && Math.abs(n.s - W.s) < 40) {
-          if (W.wr && n.lat > W.wr - hw) { n.lat = W.wr - hw; if (n.vl > 0) n.vl = 0; }
-          if (W.wl && n.lat < W.wl + hw) { n.lat = W.wl + hw; if (n.vl < 0) n.vl = 0; }
-        }
-        n.yaw += ((n.yawTarget || 0) - n.yaw) * Math.min(1, dt * 6);
-        n.v = 0; n.crashT -= dt; n.wreckT = (n.wreckT || 0) + dt;
-        if (n.crashT <= 0) { n.over = false; n.blocker = null; n.yawTarget = 0; n.ghostT = 4; } // limps off, untangling from the wreck
-        continue;
-      }
+      if (n.b) continue; // wrecked: the physics pass below moves it
       n.wreckT = 0;
       n.yaw *= Math.pow(0.05, dt); // straighten up after recovering
       if (n.dis > 0) n.dis -= dt; else if (Math.random() < n.disRate * dt) n.dis = rand(1.2, 3.2); // zoned out
@@ -226,7 +207,7 @@ module.exports = function traffic({ online, clock, send }) {
         Math.abs(o.s - n.s) < (o.len + n.T.len) / 2 + 0.5 &&
         Math.abs(o.lat - nl) < (o.wid + n.T.wid) / 2 + 0.15 &&
         Math.abs(o.lat - nl) < Math.abs(o.lat - n.lat)); // only blocks moving TOWARD it
-      if (blocked) n.vl = 0; else n.lat = clamp(nl, -ROAD_EDGE - 1, ROAD_EDGE + 1);
+      if (blocked) n.vl = 0; else n.lat = clamp(nl, Math.min(-ROAD_EDGE - 1, n.lat), Math.max(ROAD_EDGE + 1, n.lat)); // off-road: steers back, no snap
     }
 
     // collisions on the real 2D footprints (lateral position + width), sorted sweep so it stays cheap
@@ -236,17 +217,39 @@ module.exports = function traffic({ online, clock, send }) {
         const A = list[i];
         for (let j = i + 1; j < list.length && list[j].s - A.s < 12; j++) {
           const B = list[j];
-          if ((A.crashT > 0 && B.crashT > 0) || A.ghostT > 0 || B.ghostT > 0) continue;
+          if ((A.b && B.b) || A.ghostT > 0 || B.ghostT > 0) continue;
           if (Math.abs(A.lat - B.lat) > (A.T.wid + B.T.wid) / 2 - 0.1 || B.s - A.s > (A.T.len + B.T.len) / 2 - 0.2) continue;
-          const closing = Math.abs(vAlong(A) - vAlong(B));
-          const why = (A.crashT > 0 || B.crashT > 0) ? 'into-wreck' : (A.lane !== B.lane ? 'head-on' : ((A.dis > 0 || B.dis > 0) ? 'distracted' : (A.over || B.over ? 'overtake' : 'following'))) + (A.reckless || B.reckless ? '/reckless' : '');
-          // inelastic: both end up moving at the shared (momentum-weighted) speed, lighter one gets knocked aside more
-          const vA = vAlong(A), vB = vAlong(B), mA = A.T.m, mB = B.T.m, vc = (mA * vA + mB * vB) / (mA + mB);
-          const side = Math.sign(A.lat - B.lat) || 1, kick = Math.min(4, closing * 0.15);
-          crash(A, closing, side * kick * mB / (mA + mB), why, vc); crash(B, closing, -side * kick * mA / (mA + mB), why, vc);
+          if (!PHYS.contact(bodyOf(A), bodyOf(B))) continue;
+          const why = (A.b || B.b) ? 'into-wreck' : (A.lane !== B.lane ? 'head-on' : ((A.dis > 0 || B.dis > 0) ? 'distracted' : (A.over || B.over ? 'overtake' : 'following'))) + (A.reckless || B.reckless ? '/reckless' : '');
+          crash(A, why); crash(B, why);
         }
       }
+      const wrecks = [...npcs.values()].filter(n => n.b);
+      if (wrecks.length) for (const n of npcs.values()) {
+        if (n.b || n.ghostT > 0) continue;
+        for (const w of wrecks) if (Math.abs(w.s - n.s) < 14 && PHYS.contact(w.b, bodyOf(n))) { crash(n, 'into-wreck'); break; }
+      }
       // NPC-into-player contacts are reported by that player's client (real mesh contact), not guessed here
+    }
+
+    // physics: every wreck is a rigid body. step them (collisions between wrecks, walls, tyre grip), then copy back
+    const bodies = [];
+    for (const n of npcs.values()) if (n.b) {
+      const W = n.walls, b = n.b;
+      b.wl = W && Math.abs(n.s - W.s) < 40 ? W.wl : 0; b.wr = W && Math.abs(n.s - W.s) < 40 ? W.wr : 0;
+      bodies.push(b);
+    }
+    if (bodies.length) {
+      PHYS.step(bodies, dt, 3, ROAD_EDGE + 2.5);
+      for (const n of npcs.values()) if (n.b) {
+        const b = n.b, still = Math.hypot(b.vx, b.vy) < 0.3 && Math.abs(b.w) < 0.1;
+        n.s = b.x; n.lat = b.y; n.vl = b.vy; n.yaw = wrap(b.a - laneAng(n)) * 180 / Math.PI;
+        n.crashT -= dt; n.wreckT = (n.wreckT || 0) + dt;
+        if (n.crashT <= 0 && still) { // limps off, untangling from the wreck
+          n.b = null; n.crashT = 0; n.over = false; n.blocker = null; n.ghostT = 4; n.v = 0;
+          if (Math.abs(n.yaw) > 100) n.yaw = 0; // facing backwards: (off camera, it's long past) just point it the right way
+        } else if (n.crashT <= 0) n.crashT = 0.5;
+      }
     }
 
     // despawn: far from every player, off the start of the road, or nobody around.
@@ -275,29 +278,46 @@ module.exports = function traffic({ online, clock, send }) {
         buf.writeInt16LE(clamp(Math.round(vAlong(n) * 100), -32767, 32767), o + 6);
         buf.writeInt8(clamp(Math.round(n.lat * 35), -127, 127), o + 8);
         buf.writeInt8(clamp(Math.round(n.vl * 20), -127, 127), o + 9);
-        buf[o + 10] = n.T.c | (n.color << 2) | (n.brake ? 32 : 0) | (n.crashT > 0 ? 64 : 0) | (n.lane < 0 ? 128 : 0);
-        buf.writeInt8(clamp(Math.round(n.yaw / 1.5), -127, 127), o + 11);
+        buf[o + 10] = n.T.c | (n.color << 2) | (n.brake ? 32 : 0) | (n.b ? 64 : 0) | (n.lane < 0 ? 128 : 0);
+        buf.writeInt8(clamp(Math.round(n.yaw / 1.5), -127, 127), o + 11); // +-190 deg covers any heading
       });
       send(r, buf);
     }
   }
 
-  // a player hit an NPC. the client works out the momentum transfer (masses, closing speed, direction, off-centre spin)
-  // and sends the NPC's change in velocity along the road (dvs) and sideways (dvl). hard hits wreck it and it slides on
-  // that, soft bumps just shove it. capped against the reported closing speed so nobody can launch NPCs
-  function hit(p, id, v, dvs, dvl, spin, wl, wr) {
-    const n = npcs.get(id), now = clock();
-    if (!n || !p.road || !(v > 0) || now - (p.lastHit || 0) < 120) return;
+  // a player touched an NPC. the client reports the contact (point relative to the NPC + normal, in road coords) and its
+  // own velocity; the server works out the impulse with the NPC's real mass + inertia (so off-centre hits spin it) and
+  // tyre grip. hard enough and it's a wreck (a physics body), otherwise a driving car just gets nudged and drives on.
+  // everything is capped/sanity-checked so a modified client can't launch NPCs
+  const PB = { im: 0, iI: 0, w: 0 };
+  function hit(p, m) {
+    const n = npcs.get(m.id | 0), now = clock();
+    if (!n || !p.road || now - (p.lastHit || 0) < 100) return;
     if (Math.abs(n.s - p.road.s) > 25) return; // must actually be next to it
     p.lastHit = now;
-    v = Math.min(v, 60);
-    const cap = v * 1.15 + 1;
-    wr = +wr || 0; wl = +wl || 0;
+    const num = (v, a) => clamp(Number.isFinite(+v) ? +v : 0, -a, a);
+    let ns = num(m.ns, 1), nl = num(m.nl, 1); const nn = Math.hypot(ns, nl); if (nn < 0.5) return; ns /= nn; nl /= nn;
+    let pvs = num(m.pvs, 70), pvl = num(m.pvl, 30);
+    if (Math.abs(pvs - p.road.vs) > 12) pvs = p.road.vs; // must roughly match how fast the server has seen them going
+    pvl = clamp(pvl, n.vl - 10, n.vl + 10);           // and nobody drives sideways at motorway speed
+    const wr = +m.wr || 0, wl = +m.wl || 0;
     n.walls = { s: n.s, wr: wr > 1 && wr < 30 ? wr : 0, wl: wl < -1 && wl > -30 ? wl : 0 };
-    dvs = clamp(+dvs || 0, -cap, cap); dvl = clamp(+dvl || 0, -cap, cap); spin = clamp(+spin || 0, -90, 90);
-    if (v > 6 && cfg.crashes) crash(n, v, dvl, 'player-hit', vAlong(n) + dvs, spin);
-    else if (n.crashT > 0) { n.skidS = clamp(n.skidS + dvs, -40, 40); n.vl = clamp(n.vl + dvl, -12, 12); }
-    else { n.v = clamp(n.v + dvs * n.lane, 0, n.v0 * 1.3); n.vl = clamp(n.vl + dvl * 0.8, -6, 6); }
+    const B = bodyOf(n), lim = Math.hypot(B.hl, B.hw) + 0.5;
+    const c = { nx: ns, ny: nl, depth: 0, px: B.x + num(m.cs, lim), py: B.y + num(m.cl, lim) };
+    // the player as a body: real mass, no spin (their own game handles that)
+    PB.x = c.px - ns; PB.y = c.py - nl; PB.vx = pvs; PB.vy = pvl; PB.im = 1 / PHYS.mass(p.rec?.[28] | 0);
+    const vx0 = B.vx, vy0 = B.vy, w0 = B.w;
+    PHYS.resolve(PB, B, c, 0.2, 0.4, false);
+    if (n.b) { n.crashT = Math.max(n.crashT, 6); return; } // already a wreck: it just took the impulse
+    // driving: did that beat the tyres? along the car it rolls (a nudge just changes speed), across it the tyres hold
+    // ~0.85g for the ~0.1s of contact, so small side bumps are absorbed
+    const dvx = B.vx - vx0, dvy = B.vy - vy0, dw = B.w - w0;
+    const side = Math.max(0, Math.abs(dvy) - 0.8);
+    // a rider can catch a small shove; a real knock puts the bike down
+    const hard = cfg.crashes && (Math.hypot(dvx, side) > (n.T.c === 2 ? 3 : 4) || Math.abs(dw) > 0.6 || side > (n.T.c === 2 ? 2 : 1.5));
+    if (hard) { B.vy = vy0 + Math.sign(dvy) * side; crash(n, 'player-hit', B); return; }
+    n.v = clamp(n.v + dvx * n.lane, 0, n.v0 * 1.3);
+    n.vl = clamp(n.vl + Math.sign(dvy) * side, -4, 4);
   }
 
   let lastPop = 0;
@@ -316,7 +336,7 @@ module.exports = function traffic({ online, clock, send }) {
       if (a === 'on' || a === 'off') { cfg.on = a === 'on'; if (!cfg.on) { npcs.clear(); broadcast(roadPlayers()); } return 'traffic ' + a; }
       if (a === 'density' && +b >= 0 && +b <= 20) { cfg.density = +b; return 'density ' + b + ' cars/km/lane'; }
       if (a === 'crashes' && (b === 'on' || b === 'off')) { cfg.crashes = b === 'on'; return 'crashes ' + b; }
-      const wrecks = [...npcs.values()].filter(n => n.crashT > 0).length;
+      const wrecks = [...npcs.values()].filter(n => n.b).length;
       return `traffic: ${cfg.on ? 'on' : 'off'}, density ${cfg.density}, crashes ${cfg.crashes ? 'on' : 'off'}, ${npcs.size} npcs (${wrecks} wrecked) | usage: traffic on|off|density <0-20>|crashes on|off`;
     },
     get count() { return npcs.size; },

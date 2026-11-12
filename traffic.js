@@ -114,7 +114,8 @@ module.exports = function traffic({ online, clock, send }) {
         // friction depends on which way it's pointing vs where it's going: rolling straight on (rear-ended) it coasts,
         // sliding sideways the tyres scrub hard. yaw = how far it's turned from the road
         const sy = Math.abs(Math.sin(n.yaw * Math.PI / 180)), dirS = Math.sign(n.skidS || 0);
-        const frS = (1.2 + 6 * sy) * dt, fr = (1.2 + 6 * (1 - sy)) * dt;
+        // rolling straight the driver's on the brakes (~0.4g), sideways the tyres scrub (~0.75g)
+        const frS = (4 + 3.5 * sy) * dt, fr = (4 + 3.5 * (1 - sy)) * dt;
         n.skidS = Math.abs(n.skidS || 0) <= frS ? 0 : n.skidS - dirS * frS;
         if (n.skidS && occ.some(o => o.ref !== n && Math.abs(o.lat - n.lat) < 2 && (o.s - n.s) * dirS > 0 && (o.s - n.s) * dirS < (o.len + n.T.len) / 2 + 0.5)) n.skidS = 0;
         n.s += n.skidS * dt;

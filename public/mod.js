@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 11;
+  const MOD_VERSION = 13;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -394,20 +394,28 @@
     nudge(nx * push, nz * push);
 
     // 2. inelastic: cancel our share of the closing speed (vs a player: our fair half of the hit in total)
-    let j = vr < 0 ? -vr * share * (g.first ? 1.2 : 1) : 0;
+    let j = vr < 0 ? -vr * share * (g.first ? 1.2 : 1) : 0, jN = 0;
     if (!g.isNpc && j > 0) { const left = g.cv * share + 0.5 - g.used; j = Math.min(j, Math.max(left, 0.3)); g.used += j; }
+    if (g.isNpc && vr < 0) {
+      // their tyres grip the road: a parked/wrecked car is braked (~0.7g), a driving one rolls (~0.15g). the ground soaks up
+      // that much per frame, so slow pushes barely move them and you have to really shove. on impact it's negligible
+      const u = -vr * (g.first ? 1.2 : 1), fdt = (g.wreck || Math.abs(g.vs) < 1 ? 7 : 1.5) * (C.pdT || 1 / 60);
+      j = (u + fdt) * share; jN = j * mMe / mThem - fdt;
+      if (jN < 0) { jN = 0; j = -vr; } // didn't budge: it's a wall this frame
+    }
     let ix = nx * j, iz = nz * j;
     // 3. scraping friction
     const tx = rx - nx * vr, tz = rz - nz * vr;
     ix -= tx * 0.04 * share; iz -= tz * 0.04 * share;
     if (g.isNpc && (ix || iz)) {
       // equal and opposite: whatever we lost they gain, scaled by mass (lighter one moves more)
-      const k = -mMe / mThem;
-      g.pdx = (g.pdx || 0) + ix * k; g.pdz = (g.pdz || 0) + iz * k;
+      const k = -mMe / mThem, tfx = (ix - nx * j) * k, tfz = (iz - nz * j) * k; // scrape part, then the normal push
+      g.pdx = (g.pdx || 0) - nx * jN + tfx; g.pdz = (g.pdz || 0) - nz * jN + tfz;
       // off-centre hits spin them: torque about their centre from where we hit, + = anticlockwise (their yaw sign)
       const ox = (cAx + cBx) / 2 - P2.x, oz = (cAz + cBz) / 2 - P2.z;
       const Ib = (P2.M.hx * P2.M.hx + P2.M.hz * P2.M.hz) / 3;
-      g.pspin = Math.max(-80, Math.min(80, (g.pspin || 0) + (oz * ix * k - ox * iz * k) / Ib * 57.3 * 0.6));
+      const px = -nx * jN + tfx, pz = -nz * jN + tfz;
+      g.pspin = Math.max(-80, Math.min(80, (g.pspin || 0) + (oz * px - ox * pz) / Ib * 57.3 * 0.6));
       if (g.first || (now - (g.lastPush || 0) > 150 && Math.hypot(g.pdx, g.pdz) > 0.3)) { sendPush(g, g.first, now); g.first = false; }
     }
     addVel(ix, iz);
@@ -526,6 +534,31 @@
       N.s = s; N.vs = vs; N.lat = lat; N.vl = vl; N.t = st; N.tyaw = yaw; N.wreck = !!(fl & 64);
     }
   };
+  // a wheel = a round mesh low down (as tall as it is long, thin across). front ones steer. if a model packs its wheels
+  // into one mesh it just won't match and those wheels stay still, no harm done
+  const wheelOf = (p, M) => {
+    p.g.computeBoundingBox?.();
+    const b = p.g.boundingBox; if (!b) return null;
+    const c = b.min.clone(), lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < 8; i++) {
+      c.set(i & 1 ? b.max.x : b.min.x, i & 2 ? b.max.y : b.min.y, i & 4 ? b.max.z : b.min.z).applyMatrix4(p.local);
+      [c.x, c.y, c.z].forEach((v, a) => { lo[a] = Math.min(lo[a], v); hi[a] = Math.max(hi[a], v); });
+    }
+    const dx = hi[0] - lo[0], dy = hi[1] - lo[1], dz = hi[2] - lo[2], cy = (lo[1] + hi[1]) / 2;
+    if (dy < 0.35 || dy > 1.4 || Math.abs(dx - dy) > dy * 0.25 || dz > dy * 0.75 || cy > M.h * 0.45) return null;
+    const cx = (lo[0] + hi[0]) / 2, cz = (lo[2] + hi[2]) / 2;
+    return { front: cx > M.cx + M.hx * 0.2, r: dy / 2, cx, cy, cz, dz };
+  };
+  // tyre, rim and shadow of one corner are separate meshes (rim sits ~8cm outboard): turn them all about the tyre's centre
+  const pivotWheels = (ws, mk) => {
+    for (const w of ws) {
+      let hub = w;
+      for (const o of ws) if (Math.abs(o.cx - w.cx) < 0.15 && Math.abs(o.cy - w.cy) < 0.15 && Math.abs(o.cz - w.cz) < 0.3 && o.dz > hub.dz) hub = o;
+      w.r = Math.max(w.r, hub.r);
+      w.T = mk().makeTranslation(hub.cx, hub.cy, hub.cz); w.Ti = mk().makeTranslation(-hub.cx, -hub.cy, -hub.cz);
+    }
+  };
+  const WR = {};
   const fleetFor = (type, need) => {
     const M = models[type];
     if (!M || !findIM()) return null;
@@ -540,8 +573,9 @@
     F = fleets[type] = { M, cap, parts: parts.map((p, k) => {
       const im = new IM(p.g, p.mat, cap);
       im.frustumCulled = false; im.count = 0; im.matrixAutoUpdate = false;
-      return { im, local: p.local, body: k === bi };
+      return { im, local: p.local, body: k === bi, wheel: wheelOf(p, M) };
     }) };
+    pivotWheels(F.parts.map(p => p.wheel).filter(Boolean), () => parts[0].local.clone());
     const Col = parts[bi].mat.color?.constructor;
     F.colors = Col ? PALETTE.map(c => new Col(...c)) : null;
     return F;
@@ -556,13 +590,25 @@
       if (now - N.seen > 1500) { npcs.delete(N.id); continue; }
       // predict from the last packet (server sim is smooth: speed along the road + a steering-limited sideways speed)
       const age = Math.max(0, Math.min(1, (srvNow - N.t) / 1000));
-      const ps = N.s + N.vs * age, pl = N.lat + N.vl * Math.min(age, 0.5);
-      // move at its known speed, then bleed off the error to where the server says it is. (plain smoothing toward the
-      // target lagged ~4m behind at highway speed, so the car you saw wasn't where the server had it = "crashes" before contact)
-      N.rs += N.vs * dt; N.rlat += N.vl * dt * (age < 0.5 ? 1 : 0);
+      // wrecks are braking/scrubbing on the server (~5.5 m/s2), predict that too so a shoved car doesn't overshoot
+      const sg = Math.sign(N.vs), dec = N.wreck ? 5.5 : 0, ta = dec ? Math.min(age, Math.abs(N.vs) / dec) : age;
+      const ps = N.s + N.vs * ta - sg * 0.5 * dec * ta * ta, pl = N.lat + N.vl * Math.min(age, 0.5);
+      const vNow = dec ? N.vs - sg * dec * ta : N.vs;
+      N.rs += vNow * dt;
       N.rs = Math.abs(ps - N.rs) > 30 ? ps : N.rs + (ps - N.rs) * Math.min(1, dt * 4);
-      N.rlat += (pl - N.rlat) * Math.min(1, dt * 5);
-      N.rvl += (N.vl - N.rvl) * Math.min(1, dt * 6);
+      const err = pl - N.rlat, spd = Math.abs(vNow), Mb = models[N.type] || models.coupe, L = Mb ? Mb.hx * 1.25 : 2.6;
+      if (N.wreck || Math.abs(err) > 2.5 || spd < 0.8) {
+        // sliding wreck / big correction / crawling: move sideways directly (a skidding car really does go sideways)
+        N.rlat += N.vl * dt * (age < 0.5 ? 1 : 0) + err * Math.min(1, dt * 5);
+        N.hd = (N.hd || 0) * Math.pow(0.1, dt);
+      } else {
+        // driving: aim the nose where it needs to go (server's sideways speed + closing the gap), turn no faster than
+        // the front wheels allow at this speed (max ~35 deg lock), and move only where the nose points. no crabbing
+        const want = Math.max(-0.6, Math.min(0.6, Math.atan2(N.vl + Math.max(-2, Math.min(2, err * 1.5)), spd)));
+        const rate = spd / L * 0.7 * dt;
+        N.hd = (N.hd || 0) + Math.max(-rate, Math.min(rate, (want - (N.hd || 0)) * Math.min(1, dt * 8)));
+        N.rlat += spd * Math.sin(N.hd) * dt;
+      }
       N.ryaw += (N.tyaw - N.ryaw) * Math.min(1, dt * (N.wreck ? 7 : 2)); // wrecks spin out fast, recover slowly
       // walls: where the game has barriers on this stretch, NPCs (skidding wrecks, swerves) stop at them instead of passing
       // through. it's the game's own road data and identical for everyone, so every client stops them in the same place
@@ -588,9 +634,16 @@
       if (!M) continue;
       // basis: X = where it's actually heading = along the road + its sideways speed, so lane changes and dodges
       // visibly steer (nose turns into the move) instead of sliding. Y = up, Z = X × Y
-      const sp = Math.max(Math.abs(N.vs), 2);
-      const X = NM.x.set(RP.fx * N.dir * sp + RP.nx * N.rvl, RP.fy * N.dir * sp, RP.fz * N.dir * sp + RP.nz * N.rvl).normalize();
+      const ch = Math.cos(N.hd || 0), sh = Math.sin(N.hd || 0);
+      const X = NM.x.set(RP.fx * N.dir * ch + RP.nx * sh, RP.fy * N.dir * ch, RP.fz * N.dir * ch + RP.nz * sh).normalize();
       if (Math.abs(N.ryaw) > 0.001) { const c = Math.cos(N.ryaw), sn = Math.sin(N.ryaw), x = X.x; X.x = x * c + X.z * sn; X.z = -x * sn + X.z * c; }
+      const ang = Math.atan2(-X.z, X.x);
+      if (N.ang != null && dt > 0) {
+        let da = ang - N.ang; da -= Math.round(da / (2 * Math.PI)) * 2 * Math.PI;
+        const st = N.wreck || spd < 0.5 ? 0 : Math.max(-0.6, Math.min(0.6, Math.atan(da / dt * L / spd)));
+        N.steer = (N.steer || 0) + (st - (N.steer || 0)) * Math.min(1, dt * 10);
+      }
+      N.ang = ang; N.roll = (N.roll || 0) - (N.wreck ? 0 : vNow * N.dir) * dt / 0.5;
       const Y = NM.y.set(0, 1, 0).addScaledVector(X, -X.y).normalize();
       const Z = NM.z.crossVectors(X, Y);
       NM.m.makeBasis(X, Y, Z).setPosition(RP.x, RP.y, RP.z);
@@ -600,11 +653,18 @@
       if (!F) continue;
       for (const p of F.parts) {
         if (p.im.parent !== car.parent) car.parent.add(p.im);
-        NM.t.multiplyMatrices(NM.m, p.local);
+        if (p.wheel && d2 < 22500) { // close enough to see: front wheels steer, all of them roll
+          const W = p.wheel;
+          WR.a ||= NM.m.clone(); WR.b ||= NM.m.clone();
+          WR.a.makeRotationZ(N.roll / W.r * 0.5); // roll was integrated as distance/0.5m radius: rescale to this wheel
+          if (W.front && N.steer) WR.a.premultiply(WR.b.makeRotationY(N.steer));
+          NM.t.multiplyMatrices(NM.m, W.T).multiply(WR.a).multiply(W.Ti).multiply(p.local);
+        } else NM.t.multiplyMatrices(NM.m, p.local);
         p.im.setMatrixAt(idx - 1, NM.t);
         if (p.body && F.colors) p.im.setColorAt(idx - 1, F.colors[N.color]);
       }
-      N.vel[0] = RP.fx * N.vs + RP.nx * N.vl; N.vel[1] = 0; N.vel[2] = RP.fz * N.vs + RP.nz * N.vl;
+      const lv = N.wreck ? N.vl : spd * sh; // how it's actually moving on screen
+      N.vel[0] = RP.fx * vNow + RP.nx * lv; N.vel[1] = 0; N.vel[2] = RP.fz * vNow + RP.nz * lv;
       N.wx = RP.x; N.wz = RP.z; N.mapT = now; // for the minimap
       if (joined && d2 < 900) { // close enough to touch: real footprint pose for collisions
         const P = N.pose;

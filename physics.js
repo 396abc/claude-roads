@@ -82,7 +82,8 @@ function apply(b, jx, jy, rx, ry) {
 // tyres: coulomb friction along and across the body, and against spinning. a knocked-over bike slides on its side
 function tyres(b, dt, offroad) {
   const [fx, fy, rx, ry] = axes(b), k = offroad ? 1.3 : 1;
-  const muL = (b.down ? 0.55 : b.muL) * k, muS = (b.down ? 0.55 : b.muS) * k;
+  // drive = still being driven (just got shoved): rolls freely along, tyres still hold it sideways
+  const muL = (b.down ? 0.55 : b.drive ? 0.015 : b.muL) * k, muS = (b.down ? 0.55 : b.muS) * k;
   let u = b.vx * fx + b.vy * fy, s = b.vx * rx + b.vy * ry;
   const du = muL * G * dt, ds = muS * G * dt;
   u = Math.abs(u) <= du ? 0 : u - Math.sign(u) * du;

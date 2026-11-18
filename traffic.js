@@ -86,8 +86,8 @@ module.exports = function traffic({ online, clock, send }) {
   const crash = (n, why, B) => {
     if (n.b) { n.crashT = Math.max(n.crashT, 8); return n.b; }
     if (process.env.TRAFFIC_TEST) (module.exports.log ||= []).push(why);
-    n.b = B || bodyOf(n);
-    n.b.w += rand(-0.25, 0.25); // nothing lines up perfectly
+    n.b = B || bodyOf(n); n.soft = false; n.b.drive = false;
+    if (!n.b.kin) n.b.w += rand(-0.25, 0.25); // nothing lines up perfectly
     if (n.T.c === 2) n.b.down = true;
     n.crashT = rand(14, 26); n.dis = 0; n.squeeze = false; n.swerveT = 0; n.v = 0;
     return n.b;
@@ -235,7 +235,8 @@ module.exports = function traffic({ online, clock, send }) {
     // physics: every wreck is a rigid body. step them (collisions between wrecks, walls, tyre grip), then copy back
     const bodies = [], now = clock();
     for (const n of npcs.values()) if (n.b) {
-      if (n.owner && (now - n.ownT > OWN_TIMEOUT || !players.some(p => p.id === n.owner))) { n.owner = null; n.b.kin = false; }
+      if (n.owner && (now - n.ownT > OWN_TIMEOUT || !players.some(p => p.id === n.owner))) release(n);
+      if (!n.b) continue;
       const W = n.walls, b = n.b;
       b.wl = W && Math.abs(n.s - W.s) < 40 ? W.wl : 0; b.wr = W && Math.abs(n.s - W.s) < 40 ? W.wr : 0;
       bodies.push(b);
@@ -279,7 +280,7 @@ module.exports = function traffic({ online, clock, send }) {
         buf.writeInt16LE(clamp(Math.round(vAlong(n) * 100), -32767, 32767), o + 6);
         buf.writeInt8(clamp(Math.round(n.lat * 35), -127, 127), o + 8);
         buf.writeInt8(clamp(Math.round(n.vl * 20), -127, 127), o + 9);
-        buf[o + 10] = n.T.c | (n.color << 2) | (n.brake ? 32 : 0) | (n.b ? 64 : 0) | (n.lane < 0 ? 128 : 0);
+        buf[o + 10] = n.T.c | (n.color << 2) | (n.brake ? 32 : 0) | (n.b && !n.soft ? 64 : 0) | (n.lane < 0 ? 128 : 0);
         buf.writeInt8(clamp(Math.round(n.yaw / 1.5), -127, 127), o + 11); // +-190 deg covers any heading
       });
       send(r, buf);
@@ -319,8 +320,8 @@ module.exports = function traffic({ online, clock, send }) {
     n.walls = { s, wr: wr > 1 && wr < 30 ? wr : 0, wl: wl < -1 && wl > -30 ? wl : 0 };
     const B = n.b || bodyOf(n);
     Object.assign(B, { x: s, y: lat, vx: vs, vy: vl, a, w, kin: true });
-    if (n.T.c === 2) B.down = true;
-    if (!n.b) crash(n, 'player-hit', B); else n.crashT = Math.max(n.crashT, 6);
+    if (m.wreck) { if (n.T.c === 2) B.down = true; if (!n.b || n.soft) { n.b = null; crash(n, 'player-hit', B); } else n.crashT = Math.max(n.crashT, 6); }
+    else if (!n.b) { n.b = B; B.drive = true; n.soft = true; n.crashT = 1; } // just a shove: still driving, AI resumes after
     n.owner = p.id; n.ownT = now; n.ownLast = now;
     reply(p, m.id, 1);
   }
@@ -338,8 +339,20 @@ module.exports = function traffic({ online, clock, send }) {
         n.owner = null; B.kin = false; reply(p, n.id, 3); continue;
       }
       Object.assign(B, { x: s, y: lat, vx: vs, vy: vl, a, w });
-      n.ownT = n.ownLast = now; n.crashT = Math.max(n.crashT, 2);
-      if (u[7]) { n.owner = null; B.kin = false; } // owner says it's settled: back to the server
+      n.ownT = n.ownLast = now; n.crashT = Math.max(n.crashT, n.soft ? 1 : 2);
+      if (u[8] && n.soft) { n.b = null; crash(n, 'player-hit', B); if (n.T.c === 2) B.down = true; } // a shove turned into a crash
+      if (u[7]) release(n); // owner says it's done: back to the server
+    }
+  }
+  // ownership ends: a wreck carries on in the server's engine, a shoved-but-driving car goes back to the traffic AI
+  function release(n) {
+    const B = n.b; n.owner = null;
+    if (!B) return;
+    B.kin = false;
+    if (n.soft) {
+      n.b = null; n.soft = false; n.crashT = 0; n.ghostT = 1;
+      n.s = B.x; n.lat = B.y; n.v = clamp(B.vx * n.lane, 0, n.v0 * 1.3); n.vl = clamp(B.vy, -4, 4);
+      n.yaw = clamp(wrap(B.a - laneAng(n)) * 180 / Math.PI, -60, 60); // straightens itself out
     }
   }
   function applyHit(p, m) {

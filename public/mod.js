@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   // bump MOD_VERSION on every push to server/public/mod.js; bump NEEDS_LOADER only if loader.js/manifest changed
-  const MOD_VERSION = 16;
+  const MOD_VERSION = 18;
   const NEEDS_LOADER = 1;
   if (window.__srmpRan) return; // newer cached copy already running
   window.__srmpRan = MOD_VERSION;
@@ -95,7 +95,8 @@ function apply(b, jx, jy, rx, ry) {
 // tyres: coulomb friction along and across the body, and against spinning. a knocked-over bike slides on its side
 function tyres(b, dt, offroad) {
   const [fx, fy, rx, ry] = axes(b), k = offroad ? 1.3 : 1;
-  const muL = (b.down ? 0.55 : b.muL) * k, muS = (b.down ? 0.55 : b.muS) * k;
+  // drive = still being driven (just got shoved): rolls freely along, tyres still hold it sideways
+  const muL = (b.down ? 0.55 : b.drive ? 0.015 : b.muL) * k, muS = (b.down ? 0.55 : b.muS) * k;
   let u = b.vx * fx + b.vy * fy, s = b.vx * rx + b.vy * ry;
   const du = muL * G * dt, ds = muS * G * dt;
   u = Math.abs(u) <= du ? 0 : u - Math.sign(u) * du;
@@ -155,9 +156,26 @@ function step(bodies, dt, minSub = 3, edge = 6) {
   const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
   const hashWorld = () => location.hash.slice(1).split('@')[0];
 
-  // runs before the game reads the url: drop straight into the server's last known world, so joining never reloads
-  if (localStorage.srmpWorld && hashWorld() !== localStorage.srmpWorld)
-    history.replaceState(null, '', location.pathname + '#' + localStorage.srmpWorld + '@0');
+  // the game resumes a world from where you last drove: '#A2-seed@N' = start N km down the road (and it saves that per
+  // seed). everyone has to build the world from the same start or the roads/terrain/positions don't line up, so the
+  // shared world always loads at @0 with its saved progress wiped
+  const resetProgress = w => {
+    const seed = (w || '').split('-')[1];
+    try {
+      const W = JSON.parse(localStorage.settings_World || '{}');
+      if (seed) W.seed = seed;
+      W.startNode = 0; W.accumulatedDistance = 0;
+      localStorage.settings_World = JSON.stringify(W);
+      const H = JSON.parse(localStorage.settings_WorldHistory || '{}');
+      for (const sc of Object.values(H.history || {})) for (const rs of Object.values(sc || {})) if (rs?.[seed]) { rs[seed].startNode = 0; rs[seed].accumulatedDistance = 0; }
+      localStorage.settings_WorldHistory = JSON.stringify(H);
+    } catch {}
+  };
+  // runs before the game reads the url: drop straight into the server's last known world, at the start
+  if (localStorage.srmpWorld) {
+    resetProgress(localStorage.srmpWorld);
+    if (location.hash !== '#' + localStorage.srmpWorld + '@0') history.replaceState(null, '', location.pathname + '#' + localStorage.srmpWorld + '@0');
+  }
   const wait = ms => new Promise(r => setTimeout(r, ms));
   const until = async (fn, ms) => { for (const end = Date.now() + ms; Date.now() < end; await wait(100)) if (fn()) return true; return false; };
 
@@ -213,14 +231,14 @@ function step(bodies, dt, minSub = 3, edge = 6) {
   };
   const lockWorld = () => {
     for (const s of insts) {
-      if (s._type === 'World') locks.World = { seed: s.seed, scene: s.scene, roadStyle: s.roadStyle };
+      if (s._type === 'World') locks.World = { seed: s.seed, scene: s.scene, roadStyle: s.roadStyle, startNode: 0 }; // no 'resume from km X'
       if (s._type === 'Scene') locks.Scene = { scene: s.scene };
       if (isTuning(s)) { applying = true; s.resetToDefault(); applying = false; }
     }
   };
   const worldOk = () => hashWorld() === env.world;
   const gotoWorld = () => {
-    localStorage.srmpWorld = env.world;
+    localStorage.srmpWorld = env.world; resetProgress(env.world);
     sessionStorage.srmpAuto = 1;
     if (ws) ws.onclose = null;
     location.hash = env.world + '@0';
@@ -542,17 +560,19 @@ function step(bodies, dt, minSub = 3, edge = 6) {
       const PB = { x: B.x + cs - ns, y: B.y + cl - nl, vx: pvs, vy: pvl, w: 0, im: 1 / mMe, iI: 0 };
       const vx0 = T.vx, vy0 = T.vy, w0 = T.w;
       PHYS.resolve(PB, T, { nx: ns, ny: nl, depth: 0, px: B.x + cs, py: B.y + cl }, 0.2, 0.4, false);
-      let mine = owned;
+      // every touch makes it ours (we simulate it, no lag). does this one beat their tyres? same rule as the server:
+      // yes = wrecked (brakes, slides, a bike goes down), no = still driving (rolls on with the shove, AI takes back over)
+      const dvx = T.vx - vx0, side = Math.max(0, Math.abs(T.vy - vy0) - 0.8), bk = g.type === 'bike';
+      const hard = Math.hypot(dvx, side) > (bk ? 3 : 4) || Math.abs(T.w - w0) > 0.6 || side > (bk ? 2 : 1.5);
+      const mine = T;
+      if (hard && T.drive !== false) { T.drive = false; if (bk) T.down = true; g.hardNow = true; }
       if (!owned) {
-        // does it beat their tyres? same rule the server uses. a nudge stays the server's business (old path below)
-        const dvx = T.vx - vx0, side = Math.max(0, Math.abs(T.vy - vy0) - 0.8), bk = g.type === 'bike';
-        if (g.wreck || Math.hypot(dvx, side) > (bk ? 3 : 4) || Math.abs(T.w - w0) > 0.6 || side > (bk ? 2 : 1.5)) {
-          g.local = mine = T; g.ownStart = now; g.restT = 0; T.wl = g.wl || 0; T.wr = g.wr || 0; if (bk) T.down = true;
-          if (ws?.readyState === 1) ws.send(JSON.stringify({ t: 'claim', id: g.id, st: [T.x, T.y, T.vx, T.vy, T.a, T.w].map(x => +x.toFixed(3)), wl: g.wl, wr: g.wr }));
-        }
+        if (!hard && !g.wreck) T.drive = true;
+        g.local = T; g.ownStart = now; g.restT = 0; T.wl = g.wl || 0; T.wr = g.wr || 0;
+        if (ws?.readyState === 1) ws.send(JSON.stringify({ t: 'claim', id: g.id, st: [T.x, T.y, T.vx, T.vy, T.a, T.w].map(x => +x.toFixed(3)), wl: g.wl, wr: g.wr, wreck: T.drive ? 0 : 1 }));
       }
       if (mine) {
-        g.lastTouch = now; g.wreck = true;
+        g.lastTouch = now; g.wreck = !mine.drive;
         // our side of the same impulse
         let dvs = PB.vx - pvs, dvl = PB.vy - pvl, dx = fx * dvs + lx * dvl, dz = fz * dvs + lz * dvl;
         if (bike) { const fl = Math.hypot(P1.ax, P1.az) || 1, ax = P1.ax / fl, az = P1.az / fl, lo = dx * ax + dz * az, la = (dx * -az + dz * ax) * 0.5; dx = ax * lo - az * la; dz = az * lo + ax * la; }
@@ -785,7 +805,7 @@ function step(bodies, dt, minSub = 3, edge = 6) {
       if (N.local) { // ours: exactly where our engine has it
         const b = N.local;
         N.rs = b.x; N.rlat = b.y; N.vs = vNow = b.vx; N.vl = N.rvl = b.vy; spd = Math.abs(vNow); N.hd = 0;
-        N.ryaw = N.tyaw = wrapA(b.a - laneAngN(N)); N.wreck = true;
+        N.ryaw = N.tyaw = wrapA(b.a - laneAngN(N)); N.wreck = !b.drive;
       } else {
         // predict from the last packet (server sim is smooth: speed along the road + a steering-limited sideways speed)
         const age = Math.max(0, Math.min(1, (srvNow - N.t) / 1000));
@@ -1083,9 +1103,10 @@ function step(bodies, dt, minSub = 3, edge = 6) {
     for (const N of npcs.values()) {
       const B = N.local; if (!B) continue;
       N.restT = Math.hypot(B.vx, B.vy) < 0.3 && Math.abs(B.w) < 0.1 ? (N.restT || 0) + 0.1 : 0;
-      const rel = (N.restT > 1.5 && now - (N.lastTouch || 0) > 1500) || (me && Math.abs(me.s - B.x) > 80) || now - N.ownStart > 30000;
-      b.push([N.id, +B.x.toFixed(2), +B.y.toFixed(2), +B.vx.toFixed(2), +B.vy.toFixed(2), +B.a.toFixed(3), +B.w.toFixed(2), rel ? 1 : 0]);
-      if (rel) { N.local = null; N.s = B.x; N.lat = B.y; N.vs = B.vx; N.vl = B.vy; N.t = now - off; N.tyaw = N.ryaw; N.pending = 0; }
+      const idle = now - (N.lastTouch || 0);
+      const rel = (B.drive ? idle > 600 : N.restT > 1.5 && idle > 1500) || (me && Math.abs(me.s - B.x) > 80) || now - N.ownStart > 30000;
+      b.push([N.id, +B.x.toFixed(2), +B.y.toFixed(2), +B.vx.toFixed(2), +B.vy.toFixed(2), +B.a.toFixed(3), +B.w.toFixed(2), rel ? 1 : 0, B.drive ? 0 : 1]);
+      if (rel) { N.local = null; N.s = B.x; N.lat = B.y; N.vs = B.vx; N.vl = B.vy; N.t = now - off; N.tyaw = B.drive ? 0 : N.ryaw; N.wreck = !B.drive; N.pending = 0; }
       if (b.length >= 6) break;
     }
     if (b.length) ws.send(JSON.stringify({ t: 'own', b }));
@@ -1286,7 +1307,7 @@ function step(bodies, dt, minSub = 3, edge = 6) {
     fetch(SERVER.replace(/^ws/, 'http') + '/info').then(r => r.json()).then(i => {
       if (!i.world || ws) return;
       localStorage.srmpWorld = i.world;
-      if (hashWorld() !== i.world) { status('syncing world...'); location.hash = i.world + '@0'; location.reload(); }
+      if (hashWorld() !== i.world) { status('syncing world...'); resetProgress(i.world); location.hash = i.world + '@0'; location.reload(); }
     }).catch(() => {});
   };
 
